@@ -11,6 +11,10 @@
   "action": {
     "default_title": "WebRTC Analyzer — クリックで小窓の表示/非表示"
   },
+  "options_ui": {
+    "page": "src/options/options.html",
+    "open_in_tab": true
+  },
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
@@ -22,14 +26,14 @@
     },
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["src/content/bridge.js"],
+      "js": ["src/common/config.js", "src/content/bridge.js"],
       "run_at": "document_start",
       "all_frames": true,
       "match_origin_as_fallback": true
     },
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["src/content/overlay-style.js", "src/content/overlay.js"],
+      "js": ["src/common/config.js", "src/content/overlay-style.js", "src/content/overlay.js"],
       "run_at": "document_idle",
       "all_frames": true
     }

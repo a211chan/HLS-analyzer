@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>WebRTC Analyzer — 設定画面プレビュー（拡張なし）</title>
+<link rel="stylesheet" href="../src/options/options.css">
+
+<!-- chrome.* が無い素のページなので、先にエミュレータを入れる -->
+<script src="shim.js"></script>
+</head>
+<body>
+
+<script>
+/*
+ * src/options/options.html の <body> をそのまま取り込んで描画する。
+ * マークアップを二重管理しないための薄いラッパー。
+ * innerHTML 経由の <script> は実行されないので、依存は自前で順に読み込む。
+ */
+(async () => {
+  const html = await (await fetch('../src/options/options.html')).text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  document.body.innerHTML = doc.body.innerHTML;
+
+  for (const src of ['../src/common/config.js', '../src/options/options.js']) {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
+})();
+</script>
+</body>
+</html>

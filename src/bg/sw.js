@@ -12,7 +12,15 @@
 const CHANNEL = 'webrtc-analyzer';
 
 chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (!msg || msg.__wraChannel !== CHANNEL || msg.type !== 'stats') return;
+  if (!msg || msg.__wraChannel !== CHANNEL) return;
+
+  // 小窓の ⚙ ボタンから。コンテンツスクリプトは openOptionsPage を呼べない。
+  if (msg.type === 'open-options') {
+    chrome.runtime.openOptionsPage();
+    return;
+  }
+
+  if (msg.type !== 'stats') return;
 
   const tabId = sender.tab?.id;
   if (tabId == null) return;

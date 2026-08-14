@@ -12,9 +12,15 @@
   'use strict';
 
   const CHANNEL = 'webrtc-analyzer';
-  const INTERVAL_MS = 1000;
-  /** getStats() のレポートに載らなくなった統計を prev から捨てるまでの猶予 */
+  /** 監視対象が無くなってからポーリングを止めるまでの猶予 */
   const IDLE_STOP_MS = 3000;
+
+  /*
+   * ポーリング間隔は設定画面から変えられる。MAIN world からは chrome.storage を
+   * 読めないので、ISOLATED world の bridge.js が postMessage で送り込んでくる。
+   * 到着前は既定値で回しておく。
+   */
+  let intervalMs = 1000;
 
   // 同一フレームで二重に走らせない（拡張の再読み込み時など）
   if (window.__WRA_PATCHED__) return;
@@ -33,8 +39,27 @@
 
   function register(pc) {
     conns.set(pc, { id: 'pc' + ++seq, prev: new Map() });
-    if (!timer) timer = setInterval(tick, INTERVAL_MS);
+    if (!timer) timer = setInterval(tick, intervalMs);
   }
+
+  // bridge.js から設定を受け取る。世界をまたぐので postMessage（構造化クローン）を使う。
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    const d = event.data;
+    if (!d || d.__wraChannel !== CHANNEL || d.type !== 'config') return;
+
+    const v = Number(d.intervalMs);
+    // 下限を設けないとページを巻き込んで重くなる
+    if (!Number.isFinite(v) || v < 200 || v === intervalMs) return;
+    intervalMs = v;
+    if (timer) {
+      clearInterval(timer);
+      timer = setInterval(tick, intervalMs);
+    }
+  });
+
+  // bridge.js より先に読み込まれた場合に備えて、こちらからも設定を要求する
+  window.postMessage({ __wraChannel: CHANNEL, type: 'hello' }, '*');
 
   /*
    * Proxy の construct トラップを使う理由:

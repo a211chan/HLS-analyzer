@@ -30,7 +30,11 @@ var WRA_STYLE = `
   user-select: none;
 }
 
-.hud.collapsed .body { display: none; }
+/* スパークライン表示時は折れ線1本ぶん横に広げる */
+.hud.spark { min-width: 272px; }
+
+.hud.collapsed .body,
+.hud.collapsed .menu { display: none; }
 
 header {
   display: flex;
@@ -66,6 +70,37 @@ header button {
   color: #b9bec6;
 }
 header button:hover { background: rgba(255, 255, 255, 0.14); color: #fff; }
+
+header .alarm {
+  color: #ff9c8a;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* display: flex は [hidden] の UA スタイルより強いので、明示的に打ち消す */
+.menu[hidden] { display: none; }
+
+.menu {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.menu button {
+  all: unset;
+  cursor: pointer;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  color: #cfd4da;
+  background: rgba(255, 255, 255, 0.08);
+}
+.menu button:hover { background: rgba(255, 255, 255, 0.18); color: #fff; }
+.menu-note { flex-basis: 100%; color: #7fb2ff; font-size: 10px; min-height: 0; }
+.menu-note:empty { display: none; }
 
 .body { padding: 6px 8px 8px; max-height: 70vh; overflow-y: auto; }
 
@@ -110,7 +145,32 @@ header button:hover { background: rgba(255, 255, 255, 0.14); color: #fff; }
 .kv div { display: flex; gap: 4px; white-space: nowrap; }
 .kv .k { color: #838b96; }
 .kv .v { color: #e8eaed; margin-left: auto; }
-.kv .v.warn { color: #ffb37f; }
+
+/* スパークラインON: ラベル / 折れ線 / 値 の3列 */
+.kvs { padding-left: 14px; }
+.kvs > div {
+  display: grid;
+  grid-template-columns: 52px 84px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.kvs .k { color: #838b96; }
+.kvs .v { color: #e8eaed; text-align: right; }
+.kvs .sp { height: 13px; line-height: 0; }
+
+.spark { display: block; overflow: visible; }
+.spark polyline {
+  fill: none;
+  stroke: #6f86a8;
+  stroke-width: 1;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* しきい値超え */
+.v.warn { color: #ffb37f; }
+.v.crit { color: #ff8b7d; font-weight: 700; }
 
 .empty { color: #838b96; padding: 2px 0; }
 `;

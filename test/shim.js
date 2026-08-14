@@ -36,6 +36,17 @@
           setTimeout(() => changeListeners.forEach((fn) => fn(changes, 'local')), 0);
           return Promise.resolve();
         },
+        remove(keys) {
+          const changes = {};
+          for (const k of [].concat(keys)) {
+            if (!(k in store)) continue;
+            // 実 API と同じく newValue を持たせない
+            changes[k] = { oldValue: store[k] };
+            delete store[k];
+          }
+          setTimeout(() => changeListeners.forEach((fn) => fn(changes, 'local')), 0);
+          return Promise.resolve();
+        },
       },
       onChanged: { addListener: (fn) => changeListeners.push(fn) },
     },

@@ -3,17 +3,28 @@
 視聴中のページの上に小窓（HUD）を重ね、WebRTC の品質メトリクスをリアルタイム表示する Chrome 拡張。
 
 ```
-WEBRTC ANALYZER                      – ×
-example.com · pc1             connected
-  route host→srflx (udp)  rtt   24.0 ms
-  avail↑        2.50 Mbps
-↓ video 1920×1080 30fps              H264
-  bitrate  2.48 Mbps  jitter    3.2 ms
-  loss       0.12 %   buffer   48.1 ms
-  freeze          0
-↓ audio                              opus
-  bitrate    62 kbps  jitter    1.1 ms
+WEBRTC ANALYZER              ⚠ 1  ⤓ ⚙ – ×
+example.com · pc1                 connected
+  route                     host→srflx (udp)
+  rtt      ╭─╮╭──╮                   24.0 ms
+  avail↑   ──╯  ╰─                  2.50 Mbps
+↓ video 1920×1080 30fps                 H264
+  bitrate  ╭──╮╭─╮                  2.48 Mbps
+  jitter   ─╯  ╰─╯                     3.2 ms
+  loss     ────╯╰─                    0.12 %
+  buffer   ╭╮╭───╮                   328.0 ms   ← しきい値超過は色が変わる
+  freeze   ─╯╰╯                            0
 ```
+
+## できること
+
+| | |
+|---|---|
+| リアルタイム表示 | 解像度・FPS・ビットレート・ジッター・パケットロス・RTT ほか |
+| スパークライン | 各値の直近60秒の推移を折れ線で表示（範囲は変更可） |
+| しきい値アラート | 超えた値の色が変わり、ヘッダーに超過件数が出る |
+| CSV / JSON エクスポート | 計測履歴をファイルに書き出す（障害報告書への添付用） |
+| 設定画面 | 更新間隔・表示項目・しきい値・履歴の保持時間 |
 
 ## なぜ webrtc-internals をそのまま使わないのか
 
@@ -35,10 +46,34 @@ example.com · pc1             connected
 |---|---|
 | ツールバーアイコン | 小窓の表示 / 非表示 |
 | ヘッダーをドラッグ | 位置を移動（保存される） |
+| `⤓` ボタン | CSV / JSON エクスポート、履歴のクリア |
+| `⚙` ボタン | 設定画面を開く |
 | `–` ボタン | 折りたたみ（保存される） |
 | `×` ボタン | 非表示（アイコンで戻せる） |
 
 WebRTC 接続が無いページには小窓は出ない。接続が切れると 5 秒後に自動で消える。
+
+### エクスポート
+
+`⤓` から CSV / JSON を書き出す。1行 = 1サンプル × 1ストリームで、PC単位の値（RTT・経路・利用可能帯域・接続状態）も各行に載せてあるので、そのままピボットテーブルにかけられる。
+
+CSV は **BOM 付き UTF-8 + CRLF**、日時は `time_local` 列に `YYYY-MM-DD HH:MM:SS.mmm`（ローカル時刻）で入れてあるので、Excel でそのまま開いて日時として認識される。UTC が要る場合は `time_iso` 列を使う。
+
+履歴はメモリ上にのみ持つ。ページを離れるかリロードすると消えるので、**書き出しは接続中に行うこと**。既定の保持時間は30分。
+
+### しきい値
+
+既定値。設定画面で変更でき、空欄にするとその段階の判定を行わない。
+
+| 項目 | warn | crit |
+|---|---|---|
+| jitter | 30 ms | 50 ms |
+| buffer | 300 ms | 600 ms |
+| loss | 0.5 % | 2 % |
+| rtt | 150 ms | 300 ms |
+| freeze（直近1サンプルの増分） | 1 回 | 3 回 |
+
+`freeze` だけは累積値ではなく**増分**で判定する。累積のままだと一度増えたきり永久に警告が出続けるため。
 
 ## 表示している値
 
@@ -67,13 +102,26 @@ manifest.json
 src/inject/patch.js          MAIN world / 全フレーム / document_start
                              RTCPeerConnection を捕捉し getStats をポーリング、差分計算して postMessage
 src/content/bridge.js        ISOLATED / 全フレーム / document_start
-                             postMessage を受けて Service Worker へ中継
+                             上り: メトリクスを Service Worker へ中継
+                             下り: 更新間隔を MAIN world へ postMessage
 src/bg/sw.js                 Service Worker
                              トップフレームと報告元フレームへ転送、アイコンで表示ON/OFF
 src/content/overlay.js       ISOLATED / 全フレーム / document_idle
+                             HUD 描画・履歴保持・スパークライン・エクスポート
 src/content/overlay-style.js Shadow DOM に注入する HUD のスタイル
+src/common/config.js         設定の既定値とマージ処理（オーバーレイと設定画面が共有）
+src/options/                 設定画面
 test/                        検証用ページ（後述）
 ```
+
+### 設定の流れ
+
+```
+設定画面 ──▶ chrome.storage.local ──┬──▶ overlay.js   (storage.onChanged)
+                                    └──▶ bridge.js ──▶ patch.js (postMessage)
+```
+
+MAIN world からは `chrome.storage` を読めないため、更新間隔だけは bridge.js が `postMessage` で送り込む。patch.js と bridge.js のどちらが先に立ち上がっても届くよう、patch.js 側からも `hello` を投げて設定を要求している。
 
 ### 設計上の要点
 
@@ -91,13 +139,16 @@ test/                        検証用ページ（後述）
 ローカルに HTTP サーバを立てて開く。
 
 ```bash
-python3 -m http.server 8731
+python3 test/serve.py
 ```
+
+`python3 -m http.server` ではなく `test/serve.py` を使うこと。ブラウザが JS をキャッシュして書き換えが反映されない事故を防ぐため、常に `Cache-Control: no-store` を返すようにしてある。
 
 | URL | 用途 |
 |---|---|
 | http://localhost:8731/test/loopback.html | 拡張を読み込んだ状態で開く。右上に小窓が出れば成功 |
 | http://localhost:8731/test/standalone.html | 拡張なしで収集と描画だけを検証（`test/shim.js` が chrome.* を代替） |
+| http://localhost:8731/test/options-preview.html | 拡張なしで設定画面を検証 |
 
 カメラ / マイクの許可は不要。canvas の映像とオシレータの音を同一ページ内でループバックする。
 `window.__loopback.pc1` / `.pc2` から生 stats を直接叩ける。
@@ -134,11 +185,4 @@ document.querySelector('[data-wra]').shadowRoot.querySelector('.hud')
 - **`<video>` 要素そのものがフルスクリーンの場合は重ねられない**。video は子要素を描画しないため。多くのプレーヤーはコンテナ div を全画面にするので通常は問題にならない
 - ページが `document_start` より前に `RTCPeerConnection` を退避することは原理的にできないが、極端な実装のサイトでは捕捉に失敗しうる
 
-## 今回入れていないもの
-
-- スパークライン（直近 60 秒の折れ線）
-- CSV / JSON エクスポート
-- しきい値アラート
-- 設定画面（更新間隔・表示項目）
-
-更新間隔は `src/inject/patch.js` の `INTERVAL_MS`（既定 1000ms）で変えられる。
+- **履歴はページを離れると消える**。永続化していないため、エクスポートは接続中に行う必要がある
