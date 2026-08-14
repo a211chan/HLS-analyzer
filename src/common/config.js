@@ -41,12 +41,19 @@
       src: true,
     },
 
-    /** しきい値。値がこれ以上になると warn / crit で色が変わる */
+    /*
+     * しきい値。値がこれ以上になると warn / crit で色が変わる。
+     *
+     * buffer と rtt は WebRTC CDN 経由の実測に合わせてある。平常時の
+     * ジッターバッファが 250〜300ms あるスタックでは 300ms を warn にすると
+     * 常時警告になって役に立たない。逆に RTT は平常 50〜60ms なので、
+     * 上昇の兆候を掴むには 150ms では遅すぎる。
+     */
     thresholds: {
       jitterMs: { warn: 30, crit: 50 },
-      bufferMs: { warn: 300, crit: 600 },
+      bufferMs: { warn: 450, crit: 700 },
       lossPct: { warn: 0.5, crit: 2 },
-      rttMs: { warn: 150, crit: 300 },
+      rttMs: { warn: 100, crit: 200 },
       /** 直近1サンプルでのフリーズ増分 */
       freeze: { warn: 1, crit: 3 },
     },
