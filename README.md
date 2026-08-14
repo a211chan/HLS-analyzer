@@ -183,8 +183,13 @@ document.querySelector('[data-wra]').shadowRoot.querySelector('.hud')
 
 ## 既知の制限
 
+- **履歴はページを離れると消える**。永続化していないため、エクスポートは接続中に行う必要がある（[#2](https://github.com/a211chan/WebRTC-analyzer/issues/2)）
+- **`<video>` 要素そのものがフルスクリーンの場合は重ねられない**。video は子要素を描画しないため。多くのプレーヤーはコンテナ div を全画面にするので通常は問題にならない（[#3](https://github.com/a211chan/WebRTC-analyzer/issues/3)）
 - **Worker 内の `RTCPeerConnection` は捕捉できない**（現行仕様で Worker から WebRTC は使えないため、実質非該当）
-- **`<video>` 要素そのものがフルスクリーンの場合は重ねられない**。video は子要素を描画しないため。多くのプレーヤーはコンテナ div を全画面にするので通常は問題にならない
 - ページが `document_start` より前に `RTCPeerConnection` を退避することは原理的にできないが、極端な実装のサイトでは捕捉に失敗しうる
 
-- **履歴はページを離れると消える**。永続化していないため、エクスポートは接続中に行う必要がある
+## 検討中
+
+- [#1 再送・フリーズ関連の指標を追加する](https://github.com/a211chan/WebRTC-analyzer/issues/1) — `nackCount` / `pliCount` / `retransmittedPacketsReceived` / `framesDropped` / `totalFreezesDuration`。ロスゼロなのにフリーズする原因を切り分けるために要る
+- [#2 履歴の永続化](https://github.com/a211chan/WebRTC-analyzer/issues/2)
+- [#3 `<video>` 直接フルスクリーンへの対応](https://github.com/a211chan/WebRTC-analyzer/issues/3)
