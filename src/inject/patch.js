@@ -1,0 +1,277 @@
+/*
+ * WebRTC Analyzer — 収集層（MAIN world / 全フレーム / document_start）
+ *
+ * ページの RTCPeerConnection を Proxy でラップして全インスタンスを捕捉し、
+ * 標準の getStats() を定期ポーリングする。累積カウンタは差分計算まで済ませ、
+ * 表示に必要なフィールドだけを window.postMessage で bridge.js へ渡す。
+ *
+ * chrome://webrtc-internals は WebUI 特権ページで拡張から読めないため、
+ * 同じデータ源である getStats() を自前で叩くのがこの拡張の心臓部。
+ */
+(() => {
+  'use strict';
+
+  const CHANNEL = 'webrtc-analyzer';
+  const INTERVAL_MS = 1000;
+  /** getStats() のレポートに載らなくなった統計を prev から捨てるまでの猶予 */
+  const IDLE_STOP_MS = 3000;
+
+  // 同一フレームで二重に走らせない（拡張の再読み込み時など）
+  if (window.__WRA_PATCHED__) return;
+
+  const Native = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+  if (typeof Native !== 'function') return;
+
+  window.__WRA_PATCHED__ = true;
+
+  let seq = 0;
+  let timer = null;
+  let idleSince = 0;
+
+  /** @type {Map<RTCPeerConnection, {id: string, prev: Map<string, object>}>} */
+  const conns = new Map();
+
+  function register(pc) {
+    conns.set(pc, { id: 'pc' + ++seq, prev: new Map() });
+    if (!timer) timer = setInterval(tick, INTERVAL_MS);
+  }
+
+  /*
+   * Proxy の construct トラップを使う理由:
+   * RTCPeerConnection は ES class なので、関数を自前定義して prototype を代入する
+   * 古い手法では new.target 周りで壊れる。Proxy ならプロトタイプチェーン・
+   * instanceof・静的メソッド（generateCertificate）が全て素通りする。
+   */
+  const Wrapped = new Proxy(Native, {
+    construct(target, args, newTarget) {
+      const pc = Reflect.construct(target, args, newTarget);
+      try {
+        register(pc);
+      } catch (_) {
+        /* 捕捉に失敗してもページ側の動作は絶対に止めない */
+      }
+      return pc;
+    },
+  });
+
+  window.RTCPeerConnection = Wrapped;
+  if ('webkitRTCPeerConnection' in window) window.webkitRTCPeerConnection = Wrapped;
+
+  // ---------------------------------------------------------------- polling
+
+  async function tick() {
+    const pcs = [];
+
+    for (const pc of [...conns.keys()]) {
+      // signalingState は close() 後に必ず 'closed' になる。connectionState は
+      // 実装によって遷移しないことがあるので前者で判定する。
+      if (pc.signalingState === 'closed') {
+        conns.delete(pc);
+        continue;
+      }
+      const st = conns.get(pc);
+      let report;
+      try {
+        report = await pc.getStats();
+      } catch (_) {
+        continue;
+      }
+      if (!conns.has(pc)) continue; // await 中に閉じられた
+      try {
+        pcs.push(summarize(pc, st, report));
+      } catch (_) {
+        /* 1つのPCの整形失敗で全体を落とさない */
+      }
+    }
+
+    post(pcs);
+
+    // 監視対象が無くなったらタイマーを止める（非WebRTCページのコストをゼロにする）
+    if (conns.size === 0) {
+      if (!idleSince) idleSince = Date.now();
+      if (Date.now() - idleSince > IDLE_STOP_MS) {
+        clearInterval(timer);
+        timer = null;
+        idleSince = 0;
+      }
+    } else {
+      idleSince = 0;
+    }
+  }
+
+  function post(pcs) {
+    // 同一 window 内のリスナ（= ページ本体と拡張の ISOLATED world）にのみ届く。
+    // 受信側は e.source === window と __wraChannel の両方を検証すること。
+    window.postMessage({ __wraChannel: CHANNEL, type: 'stats', pcs }, '*');
+  }
+
+  // -------------------------------------------------------------- summarize
+
+  function summarize(pc, st, report) {
+    /** @type {Map<string, any>} */
+    const byId = new Map();
+    report.forEach((s) => byId.set(s.id, s));
+
+    const inbound = [];
+    const outbound = [];
+
+    for (const s of byId.values()) {
+      if (s.type === 'inbound-rtp') inbound.push(inboundRow(s, byId, st));
+      else if (s.type === 'outbound-rtp') outbound.push(outboundRow(s, byId, st));
+    }
+
+    const conn = connectionRow(byId);
+
+    // 次回の差分計算のために、今回のRTP系レポートだけを保持する
+    const next = new Map();
+    for (const s of byId.values()) {
+      if (s.type === 'inbound-rtp' || s.type === 'outbound-rtp' || s.type === 'remote-inbound-rtp') {
+        next.set(s.id, s);
+      }
+    }
+    st.prev = next;
+
+    return {
+      id: st.id,
+      state: pc.connectionState || pc.iceConnectionState || 'unknown',
+      ice: pc.iceConnectionState || null,
+      route: conn.route,
+      protocol: conn.protocol,
+      rttMs: conn.rttMs,
+      availOutBps: conn.availOutBps,
+      availInBps: conn.availInBps,
+      inbound: inbound.sort(byKind),
+      outbound: outbound.sort(byKind),
+    };
+  }
+
+  /** video を先に、audio を後に並べる（HUDで見たい順） */
+  function byKind(a, b) {
+    const rank = (k) => (k === 'video' ? 0 : k === 'audio' ? 1 : 2);
+    return rank(a.kind) - rank(b.kind);
+  }
+
+  /**
+   * 選択中の candidate-pair は transport.selectedCandidatePairId を辿るのが唯一確実。
+   * state === 'succeeded' で絞ると複数該当しうる。
+   */
+  function connectionRow(byId) {
+    let transport = null;
+    for (const s of byId.values()) {
+      if (s.type === 'transport') {
+        transport = s;
+        break;
+      }
+    }
+
+    let pair = transport && transport.selectedCandidatePairId ? byId.get(transport.selectedCandidatePairId) : null;
+    if (!pair) {
+      for (const s of byId.values()) {
+        if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') {
+          pair = s;
+          break;
+        }
+      }
+    }
+    if (!pair) return { route: null, protocol: null, rttMs: null, availOutBps: null, availInBps: null };
+
+    const local = byId.get(pair.localCandidateId);
+    const remote = byId.get(pair.remoteCandidateId);
+    const route =
+      local || remote ? `${local?.candidateType ?? '?'}→${remote?.candidateType ?? '?'}` : null;
+
+    return {
+      route,
+      protocol: local?.protocol ?? null,
+      rttMs: num(pair.currentRoundTripTime) ? pair.currentRoundTripTime * 1000 : null,
+      availOutBps: num(pair.availableOutgoingBitrate) ? pair.availableOutgoingBitrate : null,
+      availInBps: num(pair.availableIncomingBitrate) ? pair.availableIncomingBitrate : null,
+    };
+  }
+
+  function inboundRow(s, byId, st) {
+    const d = differ(s, st);
+
+    const dLost = d('packetsLost');
+    const dRecv = d('packetsReceived');
+    const dJbDelay = d('jitterBufferDelay');
+    const dJbCount = d('jitterBufferEmittedCount');
+
+    return {
+      dir: 'in',
+      kind: s.kind || s.mediaType || '?',
+      w: num(s.frameWidth) ? s.frameWidth : null,
+      h: num(s.frameHeight) ? s.frameHeight : null,
+      fps: fpsOf(s, d, 'framesDecoded'),
+      bps: rate(d('bytesReceived'), d.dt),
+      jitterMs: num(s.jitter) ? s.jitter * 1000 : null,
+      // 実効遅延。jitter（到着間隔のばらつき）より体感に近い
+      jbMs: dJbDelay !== null && dJbCount ? (dJbDelay / dJbCount) * 1000 : null,
+      lossPct: dLost !== null && dRecv !== null && dLost + dRecv > 0 ? (dLost / (dLost + dRecv)) * 100 : null,
+      freezes: num(s.freezeCount) ? s.freezeCount : null,
+      codec: byId.get(s.codecId)?.mimeType ?? null,
+    };
+  }
+
+  function outboundRow(s, byId, st) {
+    const d = differ(s, st);
+    const src = s.mediaSourceId ? byId.get(s.mediaSourceId) : null;
+
+    // 送信側の RTT / ジッター / ロスは相手からの RTCP レポート（remote-inbound-rtp）に載る
+    const remote = s.remoteId ? byId.get(s.remoteId) : null;
+
+    return {
+      dir: 'out',
+      kind: s.kind || s.mediaType || '?',
+      rid: s.rid ?? null,
+      w: num(s.frameWidth) ? s.frameWidth : null,
+      h: num(s.frameHeight) ? s.frameHeight : null,
+      // 送信元の解像度。w/h と食い違っていればダウンスケールが効いている
+      srcW: src && num(src.width) ? src.width : null,
+      srcH: src && num(src.height) ? src.height : null,
+      fps: fpsOf(s, d, 'framesSent'),
+      bps: rate(d('bytesSent'), d.dt),
+      // 送信品質が落ちた原因が一発で分かる最重要項目
+      limit: s.qualityLimitationReason && s.qualityLimitationReason !== 'none' ? s.qualityLimitationReason : null,
+      targetBps: num(s.targetBitrate) ? s.targetBitrate : null,
+      rttMs: remote && num(remote.roundTripTime) ? remote.roundTripTime * 1000 : null,
+      jitterMs: remote && num(remote.jitter) ? remote.jitter * 1000 : null,
+      lossPct: remote && num(remote.fractionLost) ? remote.fractionLost * 100 : null,
+      codec: byId.get(s.codecId)?.mimeType ?? null,
+    };
+  }
+
+  // ----------------------------------------------------------------- helpers
+
+  function num(v) {
+    return typeof v === 'number' && Number.isFinite(v);
+  }
+
+  /**
+   * 前回サンプルとの差分を返すクロージャを作る。
+   * Δt はポーリングの揺らぎを受けないよう、レポート自身の timestamp から取る。
+   * 再接続やSSRC変更でカウンタがリセットされると差分が負になるので、その場合は破棄。
+   */
+  function differ(s, st) {
+    const p = st.prev.get(s.id);
+    const dt = p && num(p.timestamp) && num(s.timestamp) ? (s.timestamp - p.timestamp) / 1000 : 0;
+    const fn = (field) => {
+      if (!p || !(dt > 0) || !num(s[field]) || !num(p[field])) return null;
+      const dv = s[field] - p[field];
+      return dv >= 0 ? dv : null;
+    };
+    fn.dt = dt;
+    return fn;
+  }
+
+  function rate(deltaBytes, dt) {
+    return deltaBytes !== null && dt > 0 ? (deltaBytes * 8) / dt : null;
+  }
+
+  /** framesPerSecond が来ない実装のために、フレーム数の差分から求め直す */
+  function fpsOf(s, d, counterField) {
+    if (num(s.framesPerSecond)) return s.framesPerSecond;
+    const df = d(counterField);
+    return df !== null && d.dt > 0 ? df / d.dt : null;
+  }
+})();

@@ -1,0 +1,144 @@
+# WebRTC Analyzer
+
+視聴中のページの上に小窓（HUD）を重ね、WebRTC の品質メトリクスをリアルタイム表示する Chrome 拡張。
+
+```
+WEBRTC ANALYZER                      – ×
+example.com · pc1             connected
+  route host→srflx (udp)  rtt   24.0 ms
+  avail↑        2.50 Mbps
+↓ video 1920×1080 30fps              H264
+  bitrate  2.48 Mbps  jitter    3.2 ms
+  loss       0.12 %   buffer   48.1 ms
+  freeze          0
+↓ audio                              opus
+  bitrate    62 kbps  jitter    1.1 ms
+```
+
+## なぜ webrtc-internals をそのまま使わないのか
+
+`chrome://webrtc-internals` は Chromium 内部の WebUI 特権ページで、拡張のコンテンツスクリプトは注入できず、公開 JS API も存在しない（`chrome.debugger` にも WebRTC 統計を返すドメインは無い）。
+
+そこで本拡張は、ページの `RTCPeerConnection` を Proxy でラップして全インスタンスを捕捉し、標準の **`getStats()`** を自前でポーリングする。webrtc-internals も内部的に同じ `getStats()` のデータ源を使っているため、**取得できる数値は実質同一**。
+
+## インストール
+
+1. Chrome で `chrome://extensions` を開く
+2. 右上の「デベロッパーモード」を ON
+3. 「パッケージ化されていない拡張機能を読み込む」→ このフォルダを選択
+
+ツールバーのアイコンをクリックすると小窓の表示 / 非表示が切り替わる。
+
+## 使い方
+
+| 操作 | 動作 |
+|---|---|
+| ツールバーアイコン | 小窓の表示 / 非表示 |
+| ヘッダーをドラッグ | 位置を移動（保存される） |
+| `–` ボタン | 折りたたみ（保存される） |
+| `×` ボタン | 非表示（アイコンで戻せる） |
+
+WebRTC 接続が無いページには小窓は出ない。接続が切れると 5 秒後に自動で消える。
+
+## 表示している値
+
+すべて標準の [`getStats()`](https://www.w3.org/TR/webrtc-stats/) 由来。累積カウンタは差分計算済み。
+
+| 表示 | 取得元 |
+|---|---|
+| 解像度 / FPS | `inbound-rtp` / `outbound-rtp` の `frameWidth`・`frameHeight`・`framesPerSecond` |
+| bitrate | `bytesReceived` / `bytesSent` の差分 × 8 ÷ Δt |
+| jitter | `jitter`（秒 → ms 換算） |
+| buffer | `jitterBufferDelay ÷ jitterBufferEmittedCount`。実効遅延で、jitter より体感に近い |
+| loss | `packetsLost ÷ (packetsLost + packetsReceived)` の差分比 |
+| freeze | `freezeCount` |
+| route | `transport.selectedCandidatePairId` を辿った先の `candidateType`。`relay` なら TURN 経由 |
+| rtt | `candidate-pair.currentRoundTripTime`（送信側は `remote-inbound-rtp.roundTripTime`） |
+| target | `outbound-rtp.targetBitrate` |
+| limit | `outbound-rtp.qualityLimitationReason`。`cpu` / `bandwidth` なら送信側がボトルネック |
+| src | 送信元の解像度。表示解像度と違えばダウンスケールが効いている |
+
+Δt はポーリングの揺らぎを避けるため、レポート自身の `timestamp` から求めている。再接続や SSRC 変更でカウンタがリセットされて差分が負になったサンプルは破棄する。
+
+## 構成
+
+```
+manifest.json
+src/inject/patch.js          MAIN world / 全フレーム / document_start
+                             RTCPeerConnection を捕捉し getStats をポーリング、差分計算して postMessage
+src/content/bridge.js        ISOLATED / 全フレーム / document_start
+                             postMessage を受けて Service Worker へ中継
+src/bg/sw.js                 Service Worker
+                             トップフレームと報告元フレームへ転送、アイコンで表示ON/OFF
+src/content/overlay.js       ISOLATED / 全フレーム / document_idle
+src/content/overlay-style.js Shadow DOM に注入する HUD のスタイル
+test/                        検証用ページ（後述）
+```
+
+### 設計上の要点
+
+- **`world: "MAIN"`** — 既定の ISOLATED world は `window` が分離されており、そこで `RTCPeerConnection` を書き換えてもページには影響しない。なお従来の「`<script src="chrome-extension://…">` を挿す」手法はページの CSP でブロックされるが、manifest で宣言した MAIN world スクリプトは Chrome が直接実行するため影響を受けない。
+- **`run_at: "document_start"`** — ページが `new RTCPeerConnection()` を呼ぶ前にラップを終える必要がある。
+- **`all_frames: true`** — 配信プレーヤーは iframe 埋め込みが多く、`RTCPeerConnection` は子フレーム側にある。
+- **Proxy の `construct` トラップ** — `RTCPeerConnection` は ES class なので、関数を自前定義して `prototype` を代入する古い手法では `new.target` 周りで壊れる。Proxy ならプロトタイプチェーン・`instanceof`・静的メソッドが素通りする。
+- **Service Worker 経由の中継** — MAIN world から `window.top.postMessage` で親に送る手もあるが、クロスオリジンでは `targetOrigin: '*'` が必要になりメトリクスがページ側のスクリプトから読めてしまう。
+- **フルスクリーン対応** — `position: fixed` はトップレイヤーの下に潜るため、`fullscreenchange` を監視して HUD をフルスクリーン要素の配下へ移す。相手が `<iframe>` の場合は親から重ねられないので、その iframe 自身のオーバーレイが担当する（overlay.js を全フレームで動かしているのはこのため）。
+
+## 検証
+
+### テストページ
+
+ローカルに HTTP サーバを立てて開く。
+
+```bash
+python3 -m http.server 8731
+```
+
+| URL | 用途 |
+|---|---|
+| http://localhost:8731/test/loopback.html | 拡張を読み込んだ状態で開く。右上に小窓が出れば成功 |
+| http://localhost:8731/test/standalone.html | 拡張なしで収集と描画だけを検証（`test/shim.js` が chrome.* を代替） |
+
+カメラ / マイクの許可は不要。canvas の映像とオシレータの音を同一ページ内でループバックする。
+`window.__loopback.pc1` / `.pc2` から生 stats を直接叩ける。
+
+```js
+(await __loopback.pc2.getStats()).forEach(s => s.type === 'inbound-rtp' && console.log(s))
+```
+
+### 数値の突き合わせ
+
+`chrome://webrtc-internals` を別タブで同時に開き、同一セッションで比較する。
+
+- bitrate が ±5% 以内で一致するか
+- 解像度・FPS が一致するか
+- jitter の単位（webrtc-internals は秒表示なので 1000 倍の差に注意）
+
+### デバッグの入口
+
+| 見る場所 | 対象 |
+|---|---|
+| ページの DevTools コンソール | `patch.js`（MAIN world）。ページのログと混在する |
+| DevTools > Sources > Content scripts | `bridge.js` / `overlay.js` |
+| `chrome://extensions` の「Service Worker」リンク | `sw.js`。非アクティブ化するのでリンクを押して起こす |
+
+HUD の中身はコンソールから触れる（Shadow Root は `open`）。
+
+```js
+document.querySelector('[data-wra]').shadowRoot.querySelector('.hud')
+```
+
+## 既知の制限
+
+- **Worker 内の `RTCPeerConnection` は捕捉できない**（現行仕様で Worker から WebRTC は使えないため、実質非該当）
+- **`<video>` 要素そのものがフルスクリーンの場合は重ねられない**。video は子要素を描画しないため。多くのプレーヤーはコンテナ div を全画面にするので通常は問題にならない
+- ページが `document_start` より前に `RTCPeerConnection` を退避することは原理的にできないが、極端な実装のサイトでは捕捉に失敗しうる
+
+## 今回入れていないもの
+
+- スパークライン（直近 60 秒の折れ線）
+- CSV / JSON エクスポート
+- しきい値アラート
+- 設定画面（更新間隔・表示項目）
+
+更新間隔は `src/inject/patch.js` の `INTERVAL_MS`（既定 1000ms）で変えられる。

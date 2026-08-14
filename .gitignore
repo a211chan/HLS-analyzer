@@ -1,0 +1,5 @@
+# Claude Code のローカル権限設定（マシン固有）
+.claude/settings.local.json
+
+# macOS
+.DS_Store

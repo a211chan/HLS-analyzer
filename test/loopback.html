@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>WebRTC Analyzer — ループバック検証（拡張あり）</title>
+<link rel="stylesheet" href="test.css">
+</head>
+<body>
+
+<h1>WebRTC Analyzer — ループバック検証</h1>
+<p>
+  拡張を読み込んだ状態でこのページを開くと、右上に小窓が出れば成功です。<br>
+  カメラ / マイクの許可は不要です。<code>chrome://webrtc-internals</code> を別タブで開き、数値を突き合わせてください。
+</p>
+
+<div class="stage">
+  <figure><canvas id="src" width="640" height="360"></canvas><figcaption>送信元 (canvas 640×360 / 30fps)</figcaption></figure>
+  <figure><video id="dst" autoplay playsinline muted></video><figcaption>受信映像</figcaption></figure>
+</div>
+
+<div id="log">初期化中...</div>
+
+<script src="loopback.js"></script>
+</body>
+</html>

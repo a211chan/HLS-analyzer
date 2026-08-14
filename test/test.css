@@ -1,0 +1,11 @@
+body { margin: 0; background: #0b0d10; color: #c9ced6;
+       font: 13px/1.6 ui-monospace, Menlo, monospace; padding: 20px; }
+h1 { font-size: 14px; color: #8e96a1; font-weight: 600; margin: 0 0 4px; }
+p  { margin: 0 0 16px; color: #6b727c; font-size: 12px; }
+code { color: #9fb8d8; }
+.stage { display: flex; gap: 16px; flex-wrap: wrap; }
+figure { margin: 0; }
+figcaption { font-size: 11px; color: #6b727c; margin-top: 4px; }
+canvas, video { width: 320px; height: 180px; background: #000; border-radius: 6px; display: block; }
+#log { margin-top: 16px; font-size: 11px; color: #6b727c; white-space: pre-wrap; }
+.note { margin-top: 20px; padding: 10px 12px; border-left: 2px solid #3a424d; color: #6b727c; font-size: 11px; }

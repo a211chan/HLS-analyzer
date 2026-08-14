@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>WebRTC Analyzer — スタンドアロン検証（拡張なし）</title>
+<link rel="stylesheet" href="test.css">
+
+<!-- 拡張の実ファイルをそのまま読み込む。patch.js は PeerConnection 生成より前に置くこと -->
+<script src="../src/inject/patch.js"></script>
+<script src="shim.js"></script>
+<script src="../src/content/bridge.js"></script>
+<script src="../src/content/overlay-style.js"></script>
+<script src="../src/content/overlay.js"></script>
+</head>
+<body>
+
+<h1>WebRTC Analyzer — スタンドアロン検証</h1>
+<p>
+  拡張をインストールせずに、収集（patch.js）と描画（overlay.js）を検証するページ。<br>
+  Service Worker の代わりに <code>shim.js</code> が chrome.* をエミュレートし、
+  bridge.js のメッセージを同一ページ内で overlay.js へ折り返します。<br>
+  <strong>拡張を有効にしたまま開くと小窓が2つ出ます</strong>（拡張側とページ側で二重に動くため）。
+  拡張を無効にして開いてください。拡張ごと確認したい場合は <a href="loopback.html">loopback.html</a> を使います。
+</p>
+
+<div class="stage">
+  <figure><canvas id="src" width="640" height="360"></canvas><figcaption>送信元 (canvas 640×360 / 30fps)</figcaption></figure>
+  <figure><video id="dst" autoplay playsinline muted></video><figcaption>受信映像</figcaption></figure>
+</div>
+
+<div id="log">初期化中...</div>
+
+<div class="note">
+  検証できること: PeerConnection の捕捉 / getStats のポーリング / 差分計算 / HUD の描画・ドラッグ・折りたたみ<br>
+  検証できないこと: manifest の world:"MAIN" 注入 / iframe をまたぐ Service Worker 中継 / フルスクリーン時の再配置
+</div>
+
+<script src="loopback.js"></script>
+</body>
+</html>
