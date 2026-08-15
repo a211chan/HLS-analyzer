@@ -1,5 +1,5 @@
 /*
- * WebRTC Analyzer — Service Worker
+ * HLS Analyzer — Service Worker
  *
  * 役割は2つだけ。
  *   1. 各フレームの bridge.js から届いたメトリクスを、描画すべきフレームへ転送する
@@ -9,10 +9,10 @@
  * 表示ON/OFFは chrome.storage.local に置き、各フレームは storage.onChanged で追従する。
  */
 
-const CHANNEL = 'webrtc-analyzer';
+const CHANNEL = 'hls-analyzer';
 
 chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (!msg || msg.__wraChannel !== CHANNEL) return;
+  if (!msg || msg.__hlaChannel !== CHANNEL) return;
 
   // 小窓の ⚙ ボタンから。コンテンツスクリプトは openOptionsPage を呼べない。
   if (msg.type === 'open-options') {

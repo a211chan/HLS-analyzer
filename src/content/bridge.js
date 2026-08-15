@@ -1,5 +1,5 @@
 /*
- * WebRTC Analyzer — 中継層（ISOLATED world / 全フレーム / document_start）
+ * HLS Analyzer — 中継層（ISOLATED world / 全フレーム / document_start）
  *
  * 双方向の橋渡しをする。
  *   上り: MAIN world の patch.js が postMessage したメトリクス → Service Worker
@@ -12,13 +12,13 @@
 (() => {
   'use strict';
 
-  const CHANNEL = 'webrtc-analyzer';
+  const CHANNEL = 'hls-analyzer';
 
   window.addEventListener('message', (event) => {
     // 出所の検証。ページ側の任意のスクリプトが偽メトリクスを送れるため必須。
     if (event.source !== window) return;
     const data = event.data;
-    if (!data || data.__wraChannel !== CHANNEL) return;
+    if (!data || data.__hlaChannel !== CHANNEL) return;
 
     // patch.js が先に立ち上がっていた場合の設定要求
     if (data.type === 'hello') {
@@ -26,14 +26,15 @@
       return;
     }
 
-    if (data.type !== 'stats' || !Array.isArray(data.pcs)) return;
+    if (data.type !== 'stats' || !Array.isArray(data.players) || !data.net) return;
 
     try {
       chrome.runtime.sendMessage({
-        __wraChannel: CHANNEL,
+        __hlaChannel: CHANNEL,
         type: 'stats',
-        pcs: data.pcs,
-        // 複数フレームのPCを区別するためのラベル。about:blank / blob: では host が空になる
+        net: data.net,
+        players: data.players,
+        // 複数フレームを区別するためのラベル。about:blank / blob: では host が空になる
         host: location.host || location.protocol || 'frame',
       });
     } catch (_) {
@@ -47,7 +48,7 @@
       .get('intervalMs')
       .then(({ intervalMs }) => {
         window.postMessage(
-          { __wraChannel: CHANNEL, type: 'config', intervalMs: intervalMs ?? 1000 },
+          { __hlaChannel: CHANNEL, type: 'config', intervalMs: intervalMs ?? 1000 },
           '*'
         );
       })

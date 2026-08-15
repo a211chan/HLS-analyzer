@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "test-server",
+      "name": "hls-test-server",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["test/serve.py", "8731"],
-      "port": 8731
+      "runtimeArgs": ["test/serve.py", "8732"],
+      "port": 8732
     }
   ]
 }

@@ -26,7 +26,7 @@ class NoCacheHandler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8731
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8732
     handler = partial(NoCacheHandler, directory=str(ROOT))
     print(f"http://localhost:{port}/test/loopback.html")
     print(f"http://localhost:{port}/test/standalone.html")

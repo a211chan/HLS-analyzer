@@ -1,11 +1,11 @@
 /*
- * WebRTC Analyzer — HUD のスタイル
+ * HLS Analyzer — HUD のスタイル
  *
  * コンテンツスクリプトは ES Modules を使えない。manifest の js: [...] に列挙した
  * ファイルは同一スコープを共有するので、グローバル変数で overlay.js へ渡す。
  * Shadow DOM 内に注入されるため、ページ側のCSSとは完全に隔離される。
  */
-var WRA_STYLE = `
+var HLA_STYLE = `
 :host { all: initial; }
 
 .hud {
@@ -14,7 +14,7 @@ var WRA_STYLE = `
   top: 12px;
   right: 12px;
   min-width: 232px;
-  max-width: 340px;
+  max-width: 380px;
   box-sizing: border-box;
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   font-size: 11px;
@@ -31,7 +31,7 @@ var WRA_STYLE = `
 }
 
 /* スパークライン表示時は折れ線1本ぶん横に広げる */
-.hud.spark { min-width: 272px; }
+.hud.spark { min-width: 300px; }
 
 .hud.collapsed .body,
 .hud.collapsed .menu { display: none; }
@@ -116,11 +116,12 @@ header .alarm {
 }
 .pc-head .src { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pc-head .state { font-weight: 600; }
-.state-connected  { color: #6ee7a0; }
-.state-connecting { color: #f5c451; }
-.state-failed,
-.state-disconnected,
-.state-closed     { color: #f2857b; }
+.state-playing { color: #6ee7a0; }
+.state-paused,
+.state-idle    { color: #9aa1ab; }
+.state-stalled { color: #f5c451; }
+.state-ended,
+.state-error   { color: #f2857b; }
 
 .stream { margin-top: 4px; }
 
@@ -150,7 +151,7 @@ header .alarm {
 .kvs { padding-left: 14px; }
 .kvs > div {
   display: grid;
-  grid-template-columns: 52px 84px minmax(0, 1fr);
+  grid-template-columns: 64px 84px minmax(0, 1fr);
   align-items: center;
   gap: 6px;
   white-space: nowrap;

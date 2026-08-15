@@ -1,5 +1,5 @@
 /*
- * WebRTC Analyzer — 設定の単一の出どころ
+ * HLS Analyzer — 設定の単一の出どころ
  *
  * コンテンツスクリプト（bridge / overlay）と設定画面の両方から読む。
  * コンテンツスクリプトは ES Modules を使えないので globalThis 経由で渡す。
@@ -7,12 +7,12 @@
  * 先頭でガードして二重定義を避ける。
  */
 (() => {
-  if (globalThis.WRA_CONFIG) return;
+  if (globalThis.HLA_CONFIG) return;
 
   const DEFAULTS = {
     /** 小窓の表示ON/OFF。ツールバーのアイコンが切り替える */
     enabled: true,
-    /** getStats() のポーリング間隔(ms)。patch.js へ postMessage で伝える */
+    /** 集計と描画の間隔(ms)。patch.js へ postMessage で伝える */
     intervalMs: 1000,
     /** スパークライン（折れ線）を出すか */
     sparkline: true,
@@ -25,37 +25,41 @@
 
     /** 表示項目。false にすると小窓から消える */
     fields: {
-      route: true,
-      avail: true,
+      variant: true,
       codec: true,
       resolution: true,
       fps: true,
-      bitrate: true,
-      target: true,
-      jitter: true,
       buffer: true,
-      loss: true,
-      freeze: true,
-      rtt: true,
-      limit: true,
-      src: true,
+      headroom: true,
+      download: true,
+      segment: true,
+      latency: true,
+      stall: true,
+      dropped: true,
+      switches: true,
+      errors: true,
+      reload: true,
     },
 
     /*
-     * しきい値。値がこれ以上になると warn / crit で色が変わる。
+     * しきい値。
      *
-     * buffer と rtt は WebRTC CDN 経由の実測に合わせてある。平常時の
-     * ジッターバッファが 250〜300ms あるスタックでは 300ms を warn にすると
-     * 常時警告になって役に立たない。逆に RTT は平常 50〜60ms なので、
-     * 上昇の兆候を掴むには 150ms では遅すぎる。
+     * WebRTC と違い、HLS には「低いほど悪い」指標がある（バッファ長・余裕度）。
+     * dir: 'below' がその向きを表す。dir は仕様なので設定画面からは変更できない。
      */
     thresholds: {
-      jitterMs: { warn: 30, crit: 50 },
-      bufferMs: { warn: 450, crit: 700 },
-      lossPct: { warn: 0.5, crit: 2 },
-      rttMs: { warn: 100, crit: 200 },
-      /** 直近1サンプルでのフリーズ増分 */
-      freeze: { warn: 1, crit: 3 },
+      /** バッファ長(秒)。痩せると stall する。ジッターバッファ相当 */
+      bufferSec: { dir: 'below', warn: 5, crit: 2 },
+      /** セグメント尺 ÷ DL時間。1.0 を割ると再生に追いつかない */
+      headroom: { dir: 'below', warn: 2, crit: 1 },
+      /** ドロップフレーム率(%) */
+      droppedPct: { dir: 'above', warn: 1, crit: 5 },
+      /** ライブ端からの遅延(秒) */
+      latencySec: { dir: 'above', warn: 30, crit: 60 },
+      /** 直近1サンプルでの stall 増分(回) */
+      stall: { dir: 'above', warn: 1, crit: 2 },
+      /** 直近1サンプルでの HTTP エラー増分(件) */
+      errors: { dir: 'above', warn: 1, crit: 1 },
     },
   };
 
@@ -77,7 +81,10 @@
     }
     if (stored.thresholds) {
       for (const [k, v] of Object.entries(stored.thresholds)) {
-        if (out.thresholds[k] && v) Object.assign(out.thresholds[k], v);
+        if (!out.thresholds[k] || !v) continue;
+        // dir は保存値で上書きさせない
+        if ('warn' in v) out.thresholds[k].warn = v.warn;
+        if ('crit' in v) out.thresholds[k].crit = v.crit;
       }
     }
     return out;
@@ -91,5 +98,5 @@
     }
   }
 
-  globalThis.WRA_CONFIG = { DEFAULTS, KEYS, merge, load };
+  globalThis.HLA_CONFIG = { DEFAULTS, KEYS, merge, load };
 })();

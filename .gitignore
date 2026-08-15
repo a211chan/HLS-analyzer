@@ -7,3 +7,6 @@
 # Python
 __pycache__/
 *.pyc
+
+# 検証用に ffmpeg で生成する HLS（test/make-stream.sh で作り直せる）
+test/stream/

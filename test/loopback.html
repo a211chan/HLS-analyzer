@@ -2,24 +2,27 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>WebRTC Analyzer — ループバック検証（拡張あり）</title>
+<title>HLS Analyzer — 再生検証（拡張あり）</title>
 <link rel="stylesheet" href="test.css">
+<script src="vendor/hls.min.js"></script>
 </head>
 <body>
 
-<h1>WebRTC Analyzer — ループバック検証</h1>
+<h1>HLS Analyzer — 再生検証</h1>
 <p>
   拡張を読み込んだ状態でこのページを開くと、右上に小窓が出れば成功です。<br>
-  カメラ / マイクの許可は不要です。<code>chrome://webrtc-internals</code> を別タブで開き、数値を突き合わせてください。
+  ローカル生成の3段ビットレート階段（720p / 480p / 360p）を hls.js で再生します。
 </p>
 
-<div class="stage">
-  <figure><canvas id="src" width="640" height="360"></canvas><figcaption>送信元 (canvas 640×360 / 30fps)</figcaption></figure>
-  <figure><video id="dst" autoplay playsinline muted></video><figcaption>受信映像</figcaption></figure>
-</div>
-
+<video id="v" controls muted playsinline></video>
+<div id="levels"></div>
 <div id="log">初期化中...</div>
 
-<script src="loopback.js"></script>
+<div class="note">
+  バリアントのボタンを押すと切替が発生します。小窓の「切替」カウントと「variant」表示が追随するか確認してください。<br>
+  ストリームが無い場合は <code>./test/make-stream.sh</code> を実行してください。
+</div>
+
+<script src="player.js"></script>
 </body>
 </html>

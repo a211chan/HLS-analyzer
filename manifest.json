@@ -1,15 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "WebRTC Analyzer",
+  "name": "HLS Analyzer",
   "version": "0.1.0",
-  "description": "視聴中のページにWebRTCの品質メトリクス（解像度・ビットレート・ジッター等）をリアルタイム表示します。",
+  "description": "視聴中のページにHLSの再生品質（解像度・バリアント・バッファ長・ダウンロード余裕度等）をリアルタイム表示します。",
   "permissions": ["storage"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "src/bg/sw.js"
   },
   "action": {
-    "default_title": "WebRTC Analyzer — クリックで小窓の表示/非表示"
+    "default_title": "HLS Analyzer — クリックで小窓の表示/非表示"
   },
   "options_ui": {
     "page": "src/options/options.html",

@@ -2,12 +2,12 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>WebRTC Analyzer 設定</title>
+<title>HLS Analyzer 設定</title>
 <link rel="stylesheet" href="options.css">
 </head>
 <body>
 
-<h1>WebRTC Analyzer <span class="sub">設定</span></h1>
+<h1>HLS Analyzer <span class="sub">設定</span></h1>
 <p class="lead">変更は自動保存され、開いているタブに即座に反映されます。</p>
 
 <section>
@@ -18,7 +18,7 @@
     <span class="ctl">
       <input type="number" id="intervalMs" min="200" max="10000" step="100"> <span class="unit">ms</span>
     </span>
-    <span class="hint">getStats() を呼ぶ間隔。短くすると細かい変動が見えるがページの負荷が増える（下限 200ms）</span>
+    <span class="hint">メトリクスを集計して小窓に送る間隔。短くすると細かい変動が見えるがページの負荷が増える（下限 200ms）</span>
   </label>
 
   <label class="row">
@@ -58,7 +58,8 @@
 
 <section>
   <h2>しきい値</h2>
-  <p class="lead">値がこれ以上になると色が変わる。空欄にするとその段階の判定を行わない。</p>
+  <p class="lead">値が条件を満たすと色が変わる。空欄にするとその段階の判定を行わない。<br>
+    <span class="inv">↓</span> が付いた項目は<strong>低いほど悪い</strong>ので「以下」で判定する。</p>
   <table id="thresholds">
     <thead>
       <tr><th>項目</th><th>警告 (warn)</th><th>重大 (crit)</th><th class="desc">補足</th></tr>

@@ -1,52 +1,476 @@
 /*
- * WebRTC Analyzer — 収集層（MAIN world / 全フレーム / document_start）
+ * HLS Analyzer — 収集層（MAIN world / 全フレーム / document_start）
  *
- * ページの RTCPeerConnection を Proxy でラップして全インスタンスを捕捉し、
- * 標準の getStats() を定期ポーリングする。累積カウンタは差分計算まで済ませ、
- * 表示に必要なフィールドだけを window.postMessage で bridge.js へ渡す。
+ * HLS には WebRTC の getStats() に相当する標準APIが無い。代わりに3つの層から集める。
  *
- * chrome://webrtc-internals は WebUI 特権ページで拡張から読めないため、
- * 同じデータ源である getStats() を自前で叩くのがこの拡張の心臓部。
+ *   1. ネットワーク : fetch / XMLHttpRequest をラップし、.m3u8 と セグメントの
+ *                     バイト数・完全ダウンロード時間・HTTPステータスを測る
+ *   2. プレイリスト : .m3u8 の中身を解析し、ビットレート階段（BANDWIDTH /
+ *                     RESOLUTION）と、いまどのバリアントを再生中かを特定する
+ *   3. 再生         : <video> 要素から解像度・バッファ長・stall・ドロップフレームを読む
+ *
+ * いずれもプレーヤー非依存。hls.js / video.js(VHS) / Shaka のどれでも動く。
+ * Chrome デスクトップは <video> のネイティブHLS再生に対応しないため、HLS は必ず
+ * JSプレーヤーが MSE 経由で再生する。つまり fetch/XHR を押さえれば取りこぼしが無い。
  */
 (() => {
   'use strict';
 
-  const CHANNEL = 'webrtc-analyzer';
+  const CHANNEL = 'hls-analyzer';
   /** 監視対象が無くなってからポーリングを止めるまでの猶予 */
-  const IDLE_STOP_MS = 3000;
+  const IDLE_STOP_MS = 5000;
+  /** スループット算出に使う直近セグメント数 */
+  const SEG_WINDOW = 5;
 
-  /*
-   * ポーリング間隔は設定画面から変えられる。MAIN world からは chrome.storage を
-   * 読めないので、ISOLATED world の bridge.js が postMessage で送り込んでくる。
-   * 到着前は既定値で回しておく。
-   */
+  // ポーリング間隔は設定画面から変えられる。MAIN world からは chrome.storage を
+  // 読めないので、ISOLATED world の bridge.js が postMessage で送り込んでくる。
   let intervalMs = 1000;
 
-  // 同一フレームで二重に走らせない（拡張の再読み込み時など）
-  if (window.__WRA_PATCHED__) return;
+  if (window.__HLA_PATCHED__) return;
+  window.__HLA_PATCHED__ = true;
 
-  const Native = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-  if (typeof Native !== 'function') return;
-
-  window.__WRA_PATCHED__ = true;
-
-  let seq = 0;
   let timer = null;
   let idleSince = 0;
 
-  /** @type {Map<RTCPeerConnection, {id: string, prev: Map<string, object>}>} */
-  const conns = new Map();
+  // ---------------------------------------------------------------- 収集状態
 
-  function register(pc) {
-    conns.set(pc, { id: 'pc' + ++seq, prev: new Map() });
-    if (!timer) timer = setInterval(tick, intervalMs);
+  /** 直近のセグメント取得。{t, url, bytes, ms, status} */
+  const segments = [];
+  /** 直近のプレイリスト取得。再読込間隔の算出に使う */
+  const playlistFetches = [];
+  /** マスタープレイリストのバリアント一覧（ビットレート昇順） */
+  let variants = [];
+  /** メディアプレイリスト url -> {targetDuration, isLive, segUrls, segDuration, lastAt} */
+  const mediaPlaylists = new Map();
+  /** 現在再生中のバリアント index。判別できなければ null */
+  let currentVariant = null;
+  let variantSwitches = 0;
+  let httpErrors = 0;
+  /** 最後に観測したセグメントの尺（EXTINF 由来、秒） */
+  let lastSegDuration = null;
+
+  // ------------------------------------------------------------ URL の分類
+
+  const SEGMENT_EXT = /\.(ts|m4s|mp4|m4v|m4a|aac|mp3|cmfv|cmfa|cmft)$/;
+
+  function classify(rawUrl) {
+    try {
+      const path = new URL(rawUrl, location.href).pathname.toLowerCase();
+      if (path.endsWith('.m3u8')) return 'playlist';
+      if (SEGMENT_EXT.test(path)) return 'segment';
+    } catch (_) {
+      /* 壊れたURLは無視 */
+    }
+    return null;
   }
 
-  // bridge.js から設定を受け取る。世界をまたぐので postMessage（構造化クローン）を使う。
+  function absolute(url) {
+    try {
+      return new URL(url, location.href).href;
+    } catch (_) {
+      return url;
+    }
+  }
+
+  // ------------------------------------------------------- 記録（共通の入口）
+
+  function recordSegment(url, bytes, ms, status) {
+    if (status >= 400 || status === 0) httpErrors++;
+    segments.push({ t: Date.now(), url: absolute(url), bytes, ms, status });
+    if (segments.length > 60) segments.shift();
+    detectVariant(absolute(url));
+    start();
+  }
+
+  function recordPlaylist(url, ms, status, text) {
+    if (status >= 400 || status === 0) httpErrors++;
+    playlistFetches.push({ t: Date.now(), url: absolute(url) });
+    if (playlistFetches.length > 40) playlistFetches.shift();
+    if (text) parsePlaylist(absolute(url), text);
+    start();
+  }
+
+  // ------------------------------------------------------- プレイリスト解析
+
+  function parsePlaylist(url, text) {
+    if (!text.includes('#EXTM3U')) return;
+    if (text.includes('#EXT-X-STREAM-INF')) parseMaster(url, text);
+    else parseMedia(url, text);
+  }
+
+  /** マスタープレイリスト → ビットレート階段 */
+  function parseMaster(url, text) {
+    const lines = text.split(/\r?\n/);
+    const found = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+      const attrs = parseAttrs(lines[i].slice(lines[i].indexOf(':') + 1));
+
+      // 属性行の次に来る非コメント行が、そのバリアントのプレイリストURL
+      let uri = null;
+      for (let j = i + 1; j < lines.length; j++) {
+        const l = lines[j].trim();
+        if (!l) continue;
+        if (l.startsWith('#')) break;
+        uri = l;
+        break;
+      }
+      if (!uri) continue;
+
+      found.push({
+        bandwidth: num(attrs.BANDWIDTH),
+        avgBandwidth: num(attrs['AVERAGE-BANDWIDTH']),
+        resolution: attrs.RESOLUTION || null,
+        codecs: attrs.CODECS || null,
+        frameRate: num(attrs['FRAME-RATE']),
+        plUrl: absolute(new URL(uri, url).href),
+      });
+    }
+
+    if (found.length) {
+      found.sort((a, b) => (a.bandwidth ?? 0) - (b.bandwidth ?? 0));
+      variants = found;
+    }
+  }
+
+  /** メディアプレイリスト → セグメント一覧・尺・LIVE/VOD */
+  function parseMedia(url, text) {
+    const lines = text.split(/\r?\n/);
+    const segUrls = new Set();
+    let targetDuration = null;
+    let lastDur = null;
+
+    for (const raw of lines) {
+      const l = raw.trim();
+      if (l.startsWith('#EXT-X-TARGETDURATION')) {
+        targetDuration = num(l.split(':')[1]);
+      } else if (l.startsWith('#EXTINF')) {
+        lastDur = num(l.slice(l.indexOf(':') + 1).split(',')[0]);
+      } else if (l && !l.startsWith('#')) {
+        try {
+          segUrls.add(new URL(l, url).href);
+        } catch (_) {}
+      }
+    }
+
+    mediaPlaylists.set(url, {
+      targetDuration,
+      // #EXT-X-ENDLIST があれば VOD、無ければ LIVE
+      isLive: !text.includes('#EXT-X-ENDLIST'),
+      segUrls,
+      segDuration: lastDur,
+      lastAt: Date.now(),
+    });
+    if (lastDur != null) lastSegDuration = lastDur;
+  }
+
+  /**
+   * いま取得したセグメントがどのバリアントのものかを、メディアプレイリストの
+   * セグメント一覧との照合で特定する。プレーヤーのAPIに一切依存しない。
+   */
+  function detectVariant(segUrl) {
+    if (!variants.length) return;
+    for (const [plUrl, pl] of mediaPlaylists) {
+      if (!pl.segUrls.has(segUrl)) continue;
+      const idx = variants.findIndex((v) => v.plUrl === plUrl);
+      if (idx < 0) return;
+      if (currentVariant != null && currentVariant !== idx) variantSwitches++;
+      currentVariant = idx;
+      return;
+    }
+  }
+
+  function parseAttrs(s) {
+    const out = {};
+    // 値はクォート付き / 無しの両方がありうる
+    const re = /([A-Z0-9-]+)=("([^"]*)"|[^,]*)/g;
+    let m;
+    while ((m = re.exec(s))) out[m[1]] = m[3] !== undefined ? m[3] : m[2];
+    return out;
+  }
+
+  function num(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // ------------------------------------------------------------- fetch 差替
+
+  const nativeFetch = window.fetch;
+  if (typeof nativeFetch === 'function') {
+    window.fetch = function (input) {
+      const url = typeof input === 'string' ? input : input?.url ?? String(input);
+      const kind = classify(url);
+      if (!kind) return nativeFetch.apply(this, arguments);
+
+      const t0 = performance.now();
+      return nativeFetch.apply(this, arguments).then(
+        (res) => {
+          // fetch の Promise はヘッダ到着で解決する。本文を読み切った時刻まで
+          // 測らないと「ダウンロード時間」にならないので、clone を消化して計る。
+          measureBody(res.clone(), kind, url, t0, res.status);
+          return res;
+        },
+        (err) => {
+          recordSegment(url, 0, performance.now() - t0, 0);
+          throw err;
+        }
+      );
+    };
+  }
+
+  async function measureBody(res, kind, url, t0, status) {
+    try {
+      if (kind === 'playlist') {
+        const text = await res.text();
+        recordPlaylist(url, performance.now() - t0, status, text);
+        return;
+      }
+      // セグメントは中身が要らない。読み捨てながらバイト数だけ数えるので、
+      // 巨大なセグメントでもメモリを抱え込まない。
+      let bytes = 0;
+      if (res.body) {
+        const reader = res.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+        }
+      } else {
+        bytes = (await res.arrayBuffer()).byteLength;
+      }
+      recordSegment(url, bytes, performance.now() - t0, status);
+    } catch (_) {
+      /* 測定に失敗してもページの再生には影響させない */
+    }
+  }
+
+  // --------------------------------------------------------------- XHR 差替
+
+  // hls.js は既定で XHR を使う。fetch だけでは取りこぼす。
+  const xhrOpen = XMLHttpRequest.prototype.open;
+  const xhrSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__hlaUrl = url;
+    return xhrOpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function () {
+    const url = this.__hlaUrl;
+    const kind = url ? classify(url) : null;
+    if (kind) {
+      const t0 = performance.now();
+      // loadend は本文を受け切ってから発火するので、そのままDL時間になる
+      this.addEventListener('loadend', (e) => {
+        const ms = performance.now() - t0;
+        if (kind === 'playlist') {
+          let text = '';
+          try {
+            if (this.responseType === '' || this.responseType === 'text') text = this.responseText;
+          } catch (_) {}
+          recordPlaylist(url, ms, this.status, text);
+        } else {
+          recordSegment(url, e.loaded || byteLengthOf(this), ms, this.status);
+        }
+      });
+    }
+    return xhrSend.apply(this, arguments);
+  };
+
+  function byteLengthOf(xhr) {
+    try {
+      const r = xhr.response;
+      if (r instanceof ArrayBuffer) return r.byteLength;
+      if (r && typeof r.size === 'number') return r.size;
+      if (typeof r === 'string') return r.length;
+    } catch (_) {}
+    return 0;
+  }
+
+  // ------------------------------------------------------------ <video> 追跡
+
+  /** video要素ごとの累積状態。要素が消えたらGCされるよう WeakMap で持つ */
+  const videoState = new WeakMap();
+  let videoSeq = 0;
+
+  function trackedVideos() {
+    const out = [];
+    for (const v of document.querySelectorAll('video')) {
+      let st = videoState.get(v);
+      if (!st) {
+        st = { id: 'v' + ++videoSeq, stalls: 0, stallMs: 0, stallAt: 0, prev: null, prevStalls: 0 };
+        videoState.set(v, st);
+        attach(v, st);
+      }
+      out.push([v, st]);
+    }
+    return out;
+  }
+
+  function attach(v, st) {
+    // stall（リバッファ）は HLS におけるフリーズ相当。waiting→playing の間隔を測る。
+    v.addEventListener('waiting', () => {
+      if (st.stallAt) return;
+      st.stallAt = performance.now();
+      st.stalls++;
+    });
+    const end = () => {
+      if (!st.stallAt) return;
+      st.stallMs += performance.now() - st.stallAt;
+      st.stallAt = 0;
+    };
+    v.addEventListener('playing', end);
+    v.addEventListener('pause', end);
+  }
+
+  function bufferAhead(v) {
+    const b = v.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (v.currentTime >= b.start(i) - 0.1 && v.currentTime <= b.end(i)) return b.end(i) - v.currentTime;
+    }
+    return 0;
+  }
+
+  /**
+   * ライブ端からの距離。seekable の終端を live edge とみなす。
+   * VOD では seekable.end は単なる総尺なので、この計算は「残り時間」になってしまう。
+   * 意味を持つのは LIVE のときだけなので、それ以外は null を返す。
+   */
+  function liveLatency(v, isLive) {
+    if (isLive !== true) return null;
+    const s = v.seekable;
+    if (!s.length) return null;
+    const d = s.end(s.length - 1) - v.currentTime;
+    return Number.isFinite(d) && d >= 0 ? d : null;
+  }
+
+  function playerRow(v, st, now, isLive) {
+    const q = typeof v.getVideoPlaybackQuality === 'function' ? v.getVideoPlaybackQuality() : null;
+    const prev = st.prev;
+    const dt = prev ? (now - prev.t) / 1000 : 0;
+
+    let fps = null;
+    let droppedPct = null;
+    if (q && prev && dt > 0) {
+      const dTotal = q.totalVideoFrames - prev.total;
+      const dDropped = q.droppedVideoFrames - prev.dropped;
+      if (dTotal >= 0) fps = dTotal / dt;
+      if (dTotal > 0 && dDropped >= 0) droppedPct = (dDropped / dTotal) * 100;
+    }
+    if (q) st.prev = { t: now, total: q.totalVideoFrames, dropped: q.droppedVideoFrames };
+
+    // stall は累積値なので、しきい値判定に使えるよう増分も出しておく
+    const stallDelta = st.stalls - st.prevStalls;
+    st.prevStalls = st.stalls;
+
+    return {
+      id: st.id,
+      state: v.ended ? 'ended' : st.stallAt ? 'stalled' : v.paused ? 'paused' : 'playing',
+      w: v.videoWidth || null,
+      h: v.videoHeight || null,
+      fps,
+      // HLS におけるジッターバッファ相当。これが痩せると stall する。
+      bufferSec: bufferAhead(v),
+      latencySec: liveLatency(v, isLive),
+      stalls: st.stalls,
+      stallSec: st.stallMs / 1000,
+      stallDelta,
+      droppedPct,
+    };
+  }
+
+  // ---------------------------------------------------------- ネットワーク集計
+
+  function netRow() {
+    const recent = segments.slice(-SEG_WINDOW).filter((s) => s.bytes > 0 && s.ms > 0);
+
+    let downloadBps = null;
+    if (recent.length) {
+      const bytes = recent.reduce((a, s) => a + s.bytes, 0);
+      const ms = recent.reduce((a, s) => a + s.ms, 0);
+      if (ms > 0) downloadBps = (bytes * 8) / (ms / 1000);
+    }
+
+    const last = recent[recent.length - 1] || null;
+    const v = currentVariant != null ? variants[currentVariant] : null;
+    const plUrl = v ? v.plUrl : null;
+    const pl = plUrl ? mediaPlaylists.get(plUrl) : lastMediaPlaylist();
+    const segDur = pl?.segDuration ?? lastSegDuration;
+
+    // プレイリストの再読込間隔（LIVE のみ意味がある）
+    const times = playlistFetches.filter((p) => p.url === (plUrl ?? pl?.url)).map((p) => p.t);
+    const plReloadSec = times.length >= 2 ? (times[times.length - 1] - times[times.length - 2]) / 1000 : null;
+
+    return {
+      live: pl ? pl.isLive : null,
+      targetDur: pl?.targetDuration ?? null,
+      segDur,
+      variantIndex: currentVariant,
+      variantCount: variants.length || null,
+      variantBps: v?.avgBandwidth ?? v?.bandwidth ?? null,
+      variantRes: v?.resolution ?? null,
+      codecs: v?.codecs ?? null,
+      switches: variantSwitches,
+      downloadBps,
+      segBytes: last?.bytes ?? null,
+      segMs: last?.ms ?? null,
+      /*
+       * 余裕度 = セグメントの尺 ÷ ダウンロードにかかった時間。
+       * 1.0 を割るとダウンロードが再生に追いつかず、いずれ必ず stall する。
+       * HLS の健全性を1つの数字で見るならこれ。
+       */
+      headroom: segDur && last?.ms ? segDur / (last.ms / 1000) : null,
+      plReloadSec,
+      errors: httpErrors,
+    };
+  }
+
+  function lastMediaPlaylist() {
+    let best = null;
+    for (const [url, pl] of mediaPlaylists) {
+      if (!best || pl.lastAt > best.lastAt) best = { ...pl, url };
+    }
+    return best;
+  }
+
+  // ------------------------------------------------------------- ポーリング
+
+  function start() {
+    if (!timer) timer = setInterval(tick, intervalMs);
+    idleSince = 0;
+  }
+
+  function tick() {
+    const now = Date.now();
+    const net = netRow();
+    const players = trackedVideos()
+      .filter(([v]) => v.readyState > 0 || !v.paused)
+      .map(([v, st]) => playerRow(v, st, now, net.live));
+
+    window.postMessage({ __hlaChannel: CHANNEL, type: 'stats', net, players }, '*');
+
+    // 再生も取得も無くなったら止める（非HLSページのコストをゼロにする）
+    const lastSeg = segments.length ? segments[segments.length - 1].t : 0;
+    if (players.length === 0 && now - lastSeg > IDLE_STOP_MS) {
+      if (!idleSince) idleSince = now;
+      if (now - idleSince > IDLE_STOP_MS) {
+        clearInterval(timer);
+        timer = null;
+        idleSince = 0;
+      }
+    } else {
+      idleSince = 0;
+    }
+  }
+
+  // --------------------------------------------------------------- 設定受信
+
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     const d = event.data;
-    if (!d || d.__wraChannel !== CHANNEL || d.type !== 'config') return;
+    if (!d || d.__hlaChannel !== CHANNEL || d.type !== 'config') return;
 
     const v = Number(d.intervalMs);
     // 下限を設けないとページを巻き込んで重くなる
@@ -59,244 +483,24 @@
   });
 
   // bridge.js より先に読み込まれた場合に備えて、こちらからも設定を要求する
-  window.postMessage({ __wraChannel: CHANNEL, type: 'hello' }, '*');
+  window.postMessage({ __hlaChannel: CHANNEL, type: 'hello' }, '*');
 
   /*
-   * Proxy の construct トラップを使う理由:
-   * RTCPeerConnection は ES class なので、関数を自前定義して prototype を代入する
-   * 古い手法では new.target 周りで壊れる。Proxy ならプロトタイプチェーン・
-   * instanceof・静的メソッド（generateCertificate）が全て素通りする。
+   * ポーリング再開のきっかけ。
+   *
+   * セグメント取得は start() を呼ぶが、それだけでは足りない。VOD を全部
+   * バッファし終えると新規の取得が起きなくなり、その状態で hls.js が
+   * レベル切替でメディアを一瞬デタッチすると readyState が 0 に落ちて
+   * 「監視対象なし」と判定され、タイマーが止まったまま復帰しなくなる。
+   *
+   * メディア系イベントはバブリングしないが、キャプチャ段階なら document で
+   * 拾える。ポーリングを増やさずに再開できる。
    */
-  const Wrapped = new Proxy(Native, {
-    construct(target, args, newTarget) {
-      const pc = Reflect.construct(target, args, newTarget);
-      try {
-        register(pc);
-      } catch (_) {
-        /* 捕捉に失敗してもページ側の動作は絶対に止めない */
-      }
-      return pc;
-    },
-  });
-
-  window.RTCPeerConnection = Wrapped;
-  if ('webkitRTCPeerConnection' in window) window.webkitRTCPeerConnection = Wrapped;
-
-  // ---------------------------------------------------------------- polling
-
-  async function tick() {
-    const pcs = [];
-
-    for (const pc of [...conns.keys()]) {
-      // signalingState は close() 後に必ず 'closed' になる。connectionState は
-      // 実装によって遷移しないことがあるので前者で判定する。
-      if (pc.signalingState === 'closed') {
-        conns.delete(pc);
-        continue;
-      }
-      const st = conns.get(pc);
-      let report;
-      try {
-        report = await pc.getStats();
-      } catch (_) {
-        continue;
-      }
-      if (!conns.has(pc)) continue; // await 中に閉じられた
-      try {
-        pcs.push(summarize(pc, st, report));
-      } catch (_) {
-        /* 1つのPCの整形失敗で全体を落とさない */
-      }
-    }
-
-    post(pcs);
-
-    // 監視対象が無くなったらタイマーを止める（非WebRTCページのコストをゼロにする）
-    if (conns.size === 0) {
-      if (!idleSince) idleSince = Date.now();
-      if (Date.now() - idleSince > IDLE_STOP_MS) {
-        clearInterval(timer);
-        timer = null;
-        idleSince = 0;
-      }
-    } else {
-      idleSince = 0;
-    }
-  }
-
-  function post(pcs) {
-    // 同一 window 内のリスナ（= ページ本体と拡張の ISOLATED world）にのみ届く。
-    // 受信側は e.source === window と __wraChannel の両方を検証すること。
-    window.postMessage({ __wraChannel: CHANNEL, type: 'stats', pcs }, '*');
-  }
-
-  // -------------------------------------------------------------- summarize
-
-  function summarize(pc, st, report) {
-    /** @type {Map<string, any>} */
-    const byId = new Map();
-    report.forEach((s) => byId.set(s.id, s));
-
-    const inbound = [];
-    const outbound = [];
-
-    for (const s of byId.values()) {
-      if (s.type === 'inbound-rtp') inbound.push(inboundRow(s, byId, st));
-      else if (s.type === 'outbound-rtp') outbound.push(outboundRow(s, byId, st));
-    }
-
-    const conn = connectionRow(byId);
-
-    // 次回の差分計算のために、今回のRTP系レポートだけを保持する
-    const next = new Map();
-    for (const s of byId.values()) {
-      if (s.type === 'inbound-rtp' || s.type === 'outbound-rtp' || s.type === 'remote-inbound-rtp') {
-        next.set(s.id, s);
-      }
-    }
-    st.prev = next;
-
-    return {
-      id: st.id,
-      state: pc.connectionState || pc.iceConnectionState || 'unknown',
-      ice: pc.iceConnectionState || null,
-      route: conn.route,
-      protocol: conn.protocol,
-      rttMs: conn.rttMs,
-      availOutBps: conn.availOutBps,
-      availInBps: conn.availInBps,
-      inbound: inbound.sort(byKind),
-      outbound: outbound.sort(byKind),
-    };
-  }
-
-  /** video を先に、audio を後に並べる（HUDで見たい順） */
-  function byKind(a, b) {
-    const rank = (k) => (k === 'video' ? 0 : k === 'audio' ? 1 : 2);
-    return rank(a.kind) - rank(b.kind);
-  }
-
-  /**
-   * 選択中の candidate-pair は transport.selectedCandidatePairId を辿るのが唯一確実。
-   * state === 'succeeded' で絞ると複数該当しうる。
-   */
-  function connectionRow(byId) {
-    let transport = null;
-    for (const s of byId.values()) {
-      if (s.type === 'transport') {
-        transport = s;
-        break;
-      }
-    }
-
-    let pair = transport && transport.selectedCandidatePairId ? byId.get(transport.selectedCandidatePairId) : null;
-    if (!pair) {
-      for (const s of byId.values()) {
-        if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') {
-          pair = s;
-          break;
-        }
-      }
-    }
-    if (!pair) return { route: null, protocol: null, rttMs: null, availOutBps: null, availInBps: null };
-
-    const local = byId.get(pair.localCandidateId);
-    const remote = byId.get(pair.remoteCandidateId);
-    const route =
-      local || remote ? `${local?.candidateType ?? '?'}→${remote?.candidateType ?? '?'}` : null;
-
-    return {
-      route,
-      protocol: local?.protocol ?? null,
-      rttMs: num(pair.currentRoundTripTime) ? pair.currentRoundTripTime * 1000 : null,
-      availOutBps: num(pair.availableOutgoingBitrate) ? pair.availableOutgoingBitrate : null,
-      availInBps: num(pair.availableIncomingBitrate) ? pair.availableIncomingBitrate : null,
-    };
-  }
-
-  function inboundRow(s, byId, st) {
-    const d = differ(s, st);
-
-    const dLost = d('packetsLost');
-    const dRecv = d('packetsReceived');
-    const dJbDelay = d('jitterBufferDelay');
-    const dJbCount = d('jitterBufferEmittedCount');
-
-    return {
-      dir: 'in',
-      kind: s.kind || s.mediaType || '?',
-      w: num(s.frameWidth) ? s.frameWidth : null,
-      h: num(s.frameHeight) ? s.frameHeight : null,
-      fps: fpsOf(s, d, 'framesDecoded'),
-      bps: rate(d('bytesReceived'), d.dt),
-      jitterMs: num(s.jitter) ? s.jitter * 1000 : null,
-      // 実効遅延。jitter（到着間隔のばらつき）より体感に近い
-      jbMs: dJbDelay !== null && dJbCount ? (dJbDelay / dJbCount) * 1000 : null,
-      lossPct: dLost !== null && dRecv !== null && dLost + dRecv > 0 ? (dLost / (dLost + dRecv)) * 100 : null,
-      freezes: num(s.freezeCount) ? s.freezeCount : null,
-      codec: byId.get(s.codecId)?.mimeType ?? null,
-    };
-  }
-
-  function outboundRow(s, byId, st) {
-    const d = differ(s, st);
-    const src = s.mediaSourceId ? byId.get(s.mediaSourceId) : null;
-
-    // 送信側の RTT / ジッター / ロスは相手からの RTCP レポート（remote-inbound-rtp）に載る
-    const remote = s.remoteId ? byId.get(s.remoteId) : null;
-
-    return {
-      dir: 'out',
-      kind: s.kind || s.mediaType || '?',
-      rid: s.rid ?? null,
-      w: num(s.frameWidth) ? s.frameWidth : null,
-      h: num(s.frameHeight) ? s.frameHeight : null,
-      // 送信元の解像度。w/h と食い違っていればダウンスケールが効いている
-      srcW: src && num(src.width) ? src.width : null,
-      srcH: src && num(src.height) ? src.height : null,
-      fps: fpsOf(s, d, 'framesSent'),
-      bps: rate(d('bytesSent'), d.dt),
-      // 送信品質が落ちた原因が一発で分かる最重要項目
-      limit: s.qualityLimitationReason && s.qualityLimitationReason !== 'none' ? s.qualityLimitationReason : null,
-      targetBps: num(s.targetBitrate) ? s.targetBitrate : null,
-      rttMs: remote && num(remote.roundTripTime) ? remote.roundTripTime * 1000 : null,
-      jitterMs: remote && num(remote.jitter) ? remote.jitter * 1000 : null,
-      lossPct: remote && num(remote.fractionLost) ? remote.fractionLost * 100 : null,
-      codec: byId.get(s.codecId)?.mimeType ?? null,
-    };
-  }
-
-  // ----------------------------------------------------------------- helpers
-
-  function num(v) {
-    return typeof v === 'number' && Number.isFinite(v);
-  }
-
-  /**
-   * 前回サンプルとの差分を返すクロージャを作る。
-   * Δt はポーリングの揺らぎを受けないよう、レポート自身の timestamp から取る。
-   * 再接続やSSRC変更でカウンタがリセットされると差分が負になるので、その場合は破棄。
-   */
-  function differ(s, st) {
-    const p = st.prev.get(s.id);
-    const dt = p && num(p.timestamp) && num(s.timestamp) ? (s.timestamp - p.timestamp) / 1000 : 0;
-    const fn = (field) => {
-      if (!p || !(dt > 0) || !num(s[field]) || !num(p[field])) return null;
-      const dv = s[field] - p[field];
-      return dv >= 0 ? dv : null;
-    };
-    fn.dt = dt;
-    return fn;
-  }
-
-  function rate(deltaBytes, dt) {
-    return deltaBytes !== null && dt > 0 ? (deltaBytes * 8) / dt : null;
-  }
-
-  /** framesPerSecond が来ない実装のために、フレーム数の差分から求め直す */
-  function fpsOf(s, d, counterField) {
-    if (num(s.framesPerSecond)) return s.framesPerSecond;
-    const df = d(counterField);
-    return df !== null && d.dt > 0 ? df / d.dt : null;
+  for (const type of ['play', 'playing', 'waiting', 'loadedmetadata', 'loadeddata', 'seeking']) {
+    document.addEventListener(type, (e) => {
+      // m3u8 を一度も踏んでいないページ（ただの mp4 等）では回さない。
+      // <all_urls> に注入される以上、非HLSページのコストはゼロにしておく。
+      if (mediaPlaylists.size && e.target instanceof HTMLMediaElement) start();
+    }, true);
   }
 })();

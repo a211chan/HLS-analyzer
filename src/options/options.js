@@ -1,5 +1,5 @@
 /*
- * WebRTC Analyzer — 設定画面
+ * HLS Analyzer — 設定画面
  *
  * chrome.storage.local に書くだけ。オーバーレイ側は storage.onChanged で追従し、
  * ポーリング間隔は bridge.js が MAIN world へ postMessage で流し込む。
@@ -7,33 +7,34 @@
 (() => {
   'use strict';
 
-  const { DEFAULTS, KEYS, merge } = WRA_CONFIG;
+  const { DEFAULTS, KEYS, merge } = HLA_CONFIG;
 
   /** 表示項目のラベル。DEFAULTS.fields のキーと対応する */
   const FIELD_LABELS = {
-    route: 'route（接続経路）',
-    avail: 'avail（利用可能帯域）',
+    variant: 'variant（バリアントと宣言ビットレート）',
     codec: 'codec（コーデック）',
-    resolution: '解像度',
+    resolution: '解像度（実際に再生中のもの）',
     fps: 'FPS',
-    bitrate: 'bitrate（ビットレート）',
-    target: 'target（目標ビットレート）',
-    jitter: 'jitter（ジッター）',
-    buffer: 'buffer（ジッターバッファ遅延）',
-    loss: 'loss（パケットロス）',
-    freeze: 'freeze（フリーズ回数）',
-    rtt: 'rtt（往復遅延）',
-    limit: 'limit（送信品質の制限理由）',
-    src: 'src（送信元解像度）',
+    buffer: 'buffer（バッファ長）',
+    headroom: '余裕度（セグメント尺 ÷ DL時間）',
+    download: 'DL速度（実測スループット）',
+    segment: 'segment（直近セグメントのサイズとDL時間）',
+    latency: 'ライブ遅延',
+    stall: 'stall（リバッファ）',
+    dropped: 'ドロップフレーム率',
+    switches: 'バリアント切替回数',
+    errors: 'HTTPエラー件数',
+    reload: 'プレイリスト再読込間隔',
   };
 
-  /** しきい値の行定義 */
+  /** しきい値の行定義。dir は config.js 側の仕様で、ここでは表示のみ */
   const THRESHOLDS = [
-    ['jitterMs', 'jitter', 'ms', '到着間隔のばらつき。平均が低くてもバーストで乱れることがある'],
-    ['bufferMs', 'buffer', 'ms', '実効遅延。jitter に対して大きすぎるならロスや順序入れ替わりの痕跡'],
-    ['lossPct', 'loss', '%', '直近1サンプルでのパケットロス率'],
-    ['rttMs', 'rtt', 'ms', '往復遅延'],
-    ['freeze', 'freeze', '回', '直近1サンプルでのフリーズ増分（累積値ではない）'],
+    ['bufferSec', 'buffer', '秒', 'バッファ長。痩せると stall する。HLS におけるジッターバッファ相当'],
+    ['headroom', '余裕度', '倍', 'セグメント尺 ÷ ダウンロード時間。1.0 を割ると再生に追いつかず必ず stall する'],
+    ['droppedPct', 'ドロップ', '%', 'デコードしたが表示を捨てたフレームの割合'],
+    ['latencySec', 'ライブ遅延', '秒', 'ライブ端からの距離。LIVE のときのみ意味がある'],
+    ['stall', 'stall', '回', '直近1サンプルでの stall 増分（累積値ではない）'],
+    ['errors', 'HTTPエラー', '件', '直近1サンプルでの HTTP エラー増分（累積値ではない）'],
   ];
 
   const $ = (id) => document.getElementById(id);
@@ -53,15 +54,18 @@
   }
 
   function buildThresholds() {
-    document.querySelector('#thresholds tbody').innerHTML = THRESHOLDS.map(
-      ([key, label, unit, desc]) => `
+    document.querySelector('#thresholds tbody').innerHTML = THRESHOLDS.map(([key, label, unit, desc]) => {
+      // buffer と余裕度は「低いほど悪い」。向きを取り違えると意味が反転するので明示する。
+      const below = DEFAULTS.thresholds[key]?.dir === 'below';
+      const dirMark = `<span class="dir">${below ? '以下' : '以上'}</span>`;
+      return `
       <tr>
-        <td class="name">${escapeHtml(label)}</td>
-        <td><input type="number" data-th="${key}" data-lv="warn" step="any" min="0"> <span class="unit">${escapeHtml(unit)}</span></td>
-        <td><input type="number" data-th="${key}" data-lv="crit" step="any" min="0"> <span class="unit">${escapeHtml(unit)}</span></td>
+        <td class="name">${escapeHtml(label)}${below ? '<span class="inv" title="低いほど悪い指標">↓</span>' : ''}</td>
+        <td><input type="number" data-th="${key}" data-lv="warn" step="any" min="0"> <span class="unit">${escapeHtml(unit)}</span>${dirMark}</td>
+        <td><input type="number" data-th="${key}" data-lv="crit" step="any" min="0"> <span class="unit">${escapeHtml(unit)}</span>${dirMark}</td>
         <td class="desc">${escapeHtml(desc)}</td>
-      </tr>`
-    ).join('');
+      </tr>`;
+    }).join('');
   }
 
   // ------------------------------------------------------------ 反映

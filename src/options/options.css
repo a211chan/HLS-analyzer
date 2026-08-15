@@ -70,6 +70,7 @@ input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px;
 
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 7px 10px 7px 0; border-top: 1px solid var(--line); vertical-align: middle; }
+td:nth-child(2), td:nth-child(3) { white-space: nowrap; }
 thead th { border-top: 0; color: var(--dim); font-weight: 500; font-size: 11px; }
 td.name { color: var(--fg); font-family: ui-monospace, Menlo, monospace; }
 td.desc, th.desc { color: #6b737e; font-size: 11px; line-height: 1.5; }
@@ -91,3 +92,6 @@ button.danger:hover { background: #2c1f1e; }
 
 .status { color: var(--accent); font-size: 12px; opacity: 0; transition: opacity 0.15s; }
 .status.on { opacity: 1; }
+
+.dir { color: #6b737e; font-size: 11px; margin-left: 2px; white-space: nowrap; }
+.inv { color: #ffb37f; margin-left: 4px; font-weight: 700; }
