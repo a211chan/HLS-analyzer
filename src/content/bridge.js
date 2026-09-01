@@ -28,19 +28,95 @@
 
     if (data.type !== 'stats' || !Array.isArray(data.players) || !data.net) return;
 
+    // patch.js の出力だけを信用することはできない。同じ world にページ本体の
+    // スクリプトが同居しており、event.source === window は偽装できてしまう。
+    // ここで形を作り直し、以降の層には既知の形しか流さない。
+    const net = netRow(data.net);
+    if (!net) return;
+
     try {
       chrome.runtime.sendMessage({
         __hlaChannel: CHANNEL,
         type: 'stats',
-        net: data.net,
-        players: data.players,
+        net,
+        players: playerRows(data.players),
         // 複数フレームを区別するためのラベル。about:blank / blob: では host が空になる
-        host: location.host || location.protocol || 'frame',
+        host: (location.host || location.protocol || 'frame').slice(0, MAX_STR),
       });
     } catch (_) {
       // 拡張の再読み込み直後は context が無効化されている。次の tick で復帰する。
     }
   });
+
+  // --------------------------------------------------------------- 検証
+
+  /*
+   * ページ側は同じ world から偽のメトリクスを postMessage できる。素通しすると、
+   *   - 想定外の型が描画層の整形関数に流れ込み、小窓が止まる
+   *   - 長大な文字列を小窓に出せる（codecs / variantRes はそのまま表示される）
+   *   - players を大量に送りつけて描画層を膨らませられる
+   * が成立する。信用するのではなく、既知のフィールドだけを写し取って作り直す。
+   */
+
+  const MAX_PLAYERS = 8;
+  const MAX_STR = 64;
+
+  function str(v, max = MAX_STR) {
+    return typeof v === 'string' && v ? v.slice(0, max) : null;
+  }
+
+  function num(v) {
+    return typeof v === 'number' && Number.isFinite(v) ? v : null;
+  }
+
+  function bool(v) {
+    return typeof v === 'boolean' ? v : null;
+  }
+
+  function netRow(n) {
+    if (!n || typeof n !== 'object') return null;
+    return {
+      live: bool(n.live),
+      targetDur: num(n.targetDur),
+      segDur: num(n.segDur),
+      variantIndex: num(n.variantIndex),
+      variantCount: num(n.variantCount),
+      variantBps: num(n.variantBps),
+      variantRes: str(n.variantRes, 24),
+      codecs: str(n.codecs, 64),
+      switches: num(n.switches),
+      downloadBps: num(n.downloadBps),
+      segBytes: num(n.segBytes),
+      segMs: num(n.segMs),
+      headroom: num(n.headroom),
+      plReloadSec: num(n.plReloadSec),
+      errors: num(n.errors),
+    };
+  }
+
+  function playerRows(list) {
+    return list.slice(0, MAX_PLAYERS).map(playerRow).filter(Boolean);
+  }
+
+  function playerRow(p) {
+    if (!p || typeof p !== 'object') return null;
+    const id = str(p.id, 32);
+    if (!id) return null;
+
+    return {
+      id,
+      state: str(p.state, 16) || 'unknown',
+      w: num(p.w),
+      h: num(p.h),
+      fps: num(p.fps),
+      bufferSec: num(p.bufferSec),
+      latencySec: num(p.latencySec),
+      stalls: num(p.stalls),
+      stallSec: num(p.stallSec),
+      stallDelta: num(p.stallDelta),
+      droppedPct: num(p.droppedPct),
+    };
+  }
 
   /** MAIN world はストレージを読めないので、こちらから送り込む */
   function pushConfig() {

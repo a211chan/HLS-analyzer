@@ -19,6 +19,11 @@
   /** これだけ更新が途絶えたストリームは表示から落とす */
   const STALE_MS = 6000;
   const RENDER_MS = 500;
+  /*
+   * Map の要素数の上限。キーは frameId なので実運用では数件にしかならないが、
+   * ページ側は iframe を大量に作れば別の frameId を無限に増やせる。頭打ちにする。
+   */
+  const MAX_FRAMES = 24;
 
   let cfg = structuredClone(HLA_CONFIG.DEFAULTS);
 
@@ -39,18 +44,32 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || msg.__hlaChannel !== CHANNEL || msg.type !== 'stats') return;
+    // 形の検証は bridge.js で済んでいるが、ここは Service Worker 越しの入口でもある。
+    // 落ちると小窓が二度と復帰しないので、最低限の形だけは自分でも確かめる。
+    if (!msg.net || typeof msg.net !== 'object' || !Array.isArray(msg.players)) return;
 
     const now = Date.now();
     const host = msg.host || 'frame';
+    const frameId = Number.isInteger(msg.frameId) ? msg.frameId : 0;
     // 再生中の <video> のうち、いちばん主たるもの1つを代表として扱う。
     // 1フレームに複数のHLS再生がある構成は稀で、あっても網羅より読みやすさを取る。
     const player = pickPlayer(msg.players);
 
-    store.set(msg.frameId, { net: msg.net, player, host, at: now });
-    record(msg.frameId, host, msg.net, player, now);
+    cap(store, MAX_FRAMES, frameId);
+    store.set(frameId, { net: msg.net, player, host, at: now });
+    record(frameId, host, msg.net, player, now);
 
     if (!ticking) ticking = setInterval(render, RENDER_MS);
   });
+
+  /** key が未登録で満杯なら、いちばん古い項目を捨てて枠を空ける（Map は挿入順） */
+  function cap(map, limit, key) {
+    if (map.has(key) || map.size < limit) return;
+    for (const k of map.keys()) {
+      map.delete(k);
+      if (map.size < limit) break;
+    }
+  }
 
   function pickPlayer(players) {
     if (!players || !players.length) return null;
@@ -64,6 +83,7 @@
   function record(frameId, host, net, player, now) {
     let h = history.get(frameId);
     if (!h) {
+      cap(history, MAX_FRAMES, frameId);
       h = { meta: { host }, samples: [] };
       history.set(frameId, h);
     }
@@ -508,33 +528,50 @@
       return;
     }
 
-    let blob;
+    let text;
+    let mime;
     if (kind === 'csv') {
       const lines = [COLS.map((c) => c[0]).join(',')];
       for (const { meta, s } of rows) lines.push(COLS.map((c) => csvCell(c[1](meta, s))).join(','));
       // BOM(U+FEFF) + CRLF。Excel で開いたときに文字化けせず、行も崩れない。
-      blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+      text = '﻿' + lines.join('\r\n');
+      mime = 'text/csv;charset=utf-8';
     } else {
       const out = rows.map(({ meta, s }) => Object.fromEntries(COLS.map((c) => [c[0], c[1](meta, s) ?? null])));
-      blob = new Blob([JSON.stringify(out, null, 1)], { type: 'application/json' });
+      text = JSON.stringify(out, null, 1);
+      mime = 'application/json';
     }
 
-    download(blob, `hls-${fileStamp()}.${kind}`);
-    note(`${rows.length} 行を書き出しました`);
+    /*
+     * ページの DOM に <a href="blob:..."> を挿してクリックする方法は使わない。
+     * blob URL はページの origin で発行されるので、ページ側が MutationObserver で
+     * href を拾えば、収集した履歴をそのまま読み取れてしまう。計測対象のサイト自身に
+     * 品質ログを渡すことになる。Service Worker の chrome.downloads に投げれば、
+     * ページ側からは保存の事実すら見えない。
+     */
+    chrome.runtime
+      .sendMessage({
+        __hlaChannel: CHANNEL,
+        type: 'download',
+        url: dataUrl(text, mime),
+        filename: `hls-${fileStamp()}.${kind}`,
+      })
+      .then((res) => {
+        if (res && res.ok) note(`${rows.length} 行を書き出しました`);
+        else note(`保存できませんでした: ${res?.error ?? '不明なエラー'}`);
+      })
+      .catch(() => note('保存できませんでした。拡張を再読み込みしてください'));
   }
 
-  function download(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.style.display = 'none';
-    (document.body || document.documentElement).appendChild(a);
-    a.click();
-    setTimeout(() => {
-      a.remove();
-      URL.revokeObjectURL(url);
-    }, 2000);
+  /** UTF-8 の文字列を data: URL にする。chrome.downloads は data: を受け付ける */
+  function dataUrl(text, mime) {
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    // 一度に渡すと引数が多すぎて RangeError になるので分割して詰める
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return `data:${mime};base64,${btoa(bin)}`;
   }
 
   function csvCell(v) {
