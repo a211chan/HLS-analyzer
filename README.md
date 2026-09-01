@@ -180,3 +180,24 @@ document.querySelector('[data-hla]').shadowRoot.querySelector('.hud')
 - **`<video>` 要素そのものがフルスクリーンの場合は重ねられない**。video は子要素を描画しないため
 - **Safari のネイティブHLS再生には使えない**。取得がブラウザ内部で行われ JS から見えない。Chrome デスクトップでは該当しない
 - **LL-HLS の部分セグメント（`#EXT-X-PART`）は未対応**。余裕度の分母がセグメント尺のままになり、ライブ遅延の精度も出ない（[#2](https://github.com/a211chan/HLS-analyzer/issues/2)）
+
+## プライバシー
+
+この拡張は**収集したデータを一切外部へ送信しない**。テレメトリも解析SDKも入っていない（`src/` にある `fetch` / `XMLHttpRequest` はページのAPIを計測用にラップしている箇所のみで、外部への通信は行わない）。
+
+- **セグメント／プレイリストのURLは外に出さない**。署名付きトークンを含みうるため、URL は収集層のメモリ内に留め、小窓にもエクスポートにも載せない
+- **メディアの中身は保持しない**。セグメントはバイト数を数えながら読み捨てる
+- `chrome.storage.local` に保存するのは設定と小窓の位置だけ。計測履歴はメモリ上にのみ置き、ページを離れると消える
+- エクスポートは `chrome.downloads` 経由で行う。ページ側から書き出し内容は読めない
+
+なお、HLS の利用有無を事前に判別できないため、コンテンツスクリプトは全ページ・全フレームに注入される。`.m3u8` を一度も踏んでいないページではポーリングを行わない。
+
+## ライセンス
+
+MIT License — [LICENSE](LICENSE) を参照。
+
+検証用に同梱している第三者のファイルは別ライセンス。詳細は [`test/vendor/README.md`](test/vendor/README.md) を参照。
+
+- **hls.js v1.5.20** — Copyright (c) Dailymotion / Apache License 2.0（[全文](test/vendor/LICENSE-hls.js)）。`test/vendor/hls.min.js` として無改変で再配布している。拡張本体は依存しない
+
+HLS および HTTP Live Streaming は Apple Inc. の商標。この拡張は Apple とは無関係の非公式ツール。
