@@ -85,6 +85,8 @@
       variantRes: str(n.variantRes, 24),
       codecs: str(n.codecs, 64),
       switches: num(n.switches),
+      cached: bool(n.cached),
+      repeat: bool(n.repeat),
       downloadBps: num(n.downloadBps),
       segBytes: num(n.segBytes),
       segMs: num(n.segMs),
@@ -114,6 +116,10 @@
       stalls: num(p.stalls),
       stallSec: num(p.stallSec),
       stallDelta: num(p.stallDelta),
+      freezes: num(p.freezes),
+      freezeSec: num(p.freezeSec),
+      freezeDelta: num(p.freezeDelta),
+      visible: bool(p.visible),
       droppedPct: num(p.droppedPct),
     };
   }

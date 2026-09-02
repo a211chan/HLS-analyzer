@@ -84,7 +84,9 @@
     let h = history.get(frameId);
     if (!h) {
       cap(history, MAX_FRAMES, frameId);
-      h = { meta: { host }, samples: [] };
+      // frame は「どのプレーヤーの行か」を復元する唯一の手がかり。1ページに複数の
+      // プレーヤーが iframe で並ぶ構成では、これが無いと書き出しを読み解けない。
+      h = { meta: { host, frame: frameId }, samples: [] };
       history.set(frameId, h);
     }
     h.samples.push({
@@ -98,7 +100,13 @@
       stalls: player?.stalls ?? null,
       stallSec: player?.stallSec ?? null,
       stallDelta: player?.stallDelta ?? null,
+      freezes: player?.freezes ?? null,
+      freezeSec: player?.freezeSec ?? null,
+      freezeDelta: player?.freezeDelta ?? null,
+      visible: player?.visible ?? null,
       droppedPct: player?.droppedPct ?? null,
+      cached: net.cached ?? null,
+      repeat: net.repeat ?? null,
       live: net.live,
       variantIndex: net.variantIndex,
       variantCount: net.variantCount,
@@ -331,8 +339,9 @@
     const droppedLv = level('droppedPct', player?.droppedPct);
     const latencyLv = level('latencySec', player?.latencySec);
     const stallLv = level('stall', player?.stallDelta);
+    const freezeLv = level('freeze', player?.freezeDelta);
     const errorLv = level('errors', deltaOf(samples, 'errors'));
-    const crit = [bufferLv, headroomLv, droppedLv, latencyLv, stallLv, errorLv].filter((l) => l === 'crit').length;
+    const crit = [bufferLv, headroomLv, droppedLv, latencyLv, stallLv, freezeLv, errorLv].filter((l) => l === 'crit').length;
 
     const mode = net.live === true ? 'LIVE' : net.live === false ? 'VOD' : '';
     const variant =
@@ -349,11 +358,21 @@
       // HLS におけるジッターバッファ相当。痩せると stall する。
       { key: 'buffer', label: 'buffer', value: sec(player?.bufferSec), level: bufferLv, field: 'bufferSec' },
       // 1.0 を割るとダウンロードが再生に追いつかない。HLS の健全性はまずここ。
-      { key: 'headroom', label: '余裕度', value: ratio(net.headroom), level: headroomLv, field: 'headroom' },
+      {
+        key: 'headroom',
+        label: '余裕度',
+        // キャッシュから返ったセグメントは集計から外しているが、それでも直近に
+        // ヒットがあったなら「回線を測れていない」ことを見えるようにしておく
+        value: net.headroom != null ? ratio(net.headroom) + (net.cached || net.repeat ? ' (cache)' : '') : null,
+        level: headroomLv,
+        field: 'headroom',
+      },
       { key: 'download', label: 'DL速度', value: bps(net.downloadBps), field: 'downloadBps' },
       { key: 'segment', label: 'segment', value: segLabel(net), field: 'segMs' },
       { key: 'latency', label: 'ライブ遅延', value: sec(player?.latencySec), level: latencyLv, field: 'latencySec' },
       { key: 'stall', label: 'stall', value: stallLabel(player), level: stallLv, field: 'stalls' },
+      // バッファがあるのに絵が止まった回数。stall とは別の失敗の仕方。
+      { key: 'freeze', label: 'フリーズ', value: freezeLabel(player), level: freezeLv, field: 'freezes' },
       { key: 'dropped', label: 'ドロップ', value: pct(player?.droppedPct), level: droppedLv, field: 'droppedPct' },
       { key: 'switches', label: '切替', value: net.switches ? `${net.switches} 回` : null, field: 'switches' },
       { key: 'reload', label: 'PL再読込', value: net.live ? sec(net.plReloadSec) : null, field: 'plReloadSec' },
@@ -385,6 +404,12 @@
   function segLabel(net) {
     if (net.segBytes == null || net.segMs == null) return null;
     return `${bytes(net.segBytes)} / ${Math.round(net.segMs)} ms`;
+  }
+
+  function freezeLabel(player) {
+    if (!player || player.freezes == null) return null;
+    if (!player.freezes) return '0';
+    return `${player.freezes} 回 / ${player.freezeSec.toFixed(1)} s`;
   }
 
   function stallLabel(player) {
@@ -488,6 +513,7 @@
     ['time_local', (m, s) => localStamp(s.t)],
     ['time_iso', (m, s) => new Date(s.t).toISOString()],
     ['host', (m) => m.host],
+    ['frame', (m) => m.frame],
     ['mode', (m, s) => (s.live === true ? 'LIVE' : s.live === false ? 'VOD' : '')],
     ['state', (m, s) => s.state],
     ['width', (m, s) => s.w],
@@ -509,7 +535,14 @@
     ['live_latency_sec', (m, s) => round(s.latencySec, 2)],
     ['stall_count', (m, s) => s.stalls],
     ['stall_total_sec', (m, s) => round(s.stallSec, 2)],
+    ['freeze_count', (m, s) => s.freezes],
+    ['freeze_total_sec', (m, s) => round(s.freezeSec, 2)],
+    ['visible', (m, s) => (s.visible == null ? '' : s.visible ? 'true' : 'false')],
     ['dropped_pct', (m, s) => round(s.droppedPct, 3)],
+    // 空欄は「判定できなかった」。false（実ダウンロード）と区別すること。
+    ['from_cache', (m, s) => (s.cached == null ? '' : s.cached ? 'true' : 'false')],
+    // 2回目以降のURL。キャッシュを判定できない配信ではこちらが手がかりになる。
+    ['segment_repeat', (m, s) => (s.repeat == null ? '' : s.repeat ? 'true' : 'false')],
     ['playlist_reload_sec', (m, s) => round(s.plReloadSec, 2)],
     ['http_errors', (m, s) => s.errors],
   ];

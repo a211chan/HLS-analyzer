@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HLS Analyzer",
-  "version": "0.2.0",
+  "version": "0.3.3",
   "description": "視聴中のページにHLSの再生品質（解像度・バリアント・バッファ長・ダウンロード余裕度等）をリアルタイム表示します。",
   "permissions": ["storage", "downloads"],
   "host_permissions": ["http://*/*", "https://*/*"],
