@@ -19,11 +19,15 @@
   /** これだけ更新が途絶えたストリームは表示から落とす */
   const STALE_MS = 6000;
   const RENDER_MS = 500;
+  /** 受信が途切れている間の描画間隔。値は動かないので落としてよい */
+  const IDLE_MS = 5000;
   /*
    * Map の要素数の上限。キーは frameId なので実運用では数件にしかならないが、
    * ページ側は iframe を大量に作れば別の frameId を無限に増やせる。頭打ちにする。
    */
   const MAX_FRAMES = 24;
+  /** 溜めたログを Service Worker へ送る間隔(ms) */
+  const FLUSH_MS = 3000;
 
   let cfg = structuredClone(HLA_CONFIG.DEFAULTS);
 
@@ -39,6 +43,10 @@
   let hostEl = null;
   let menuEl = null;
   let ticking = null;
+  let tickMs = 0;
+  let flushing = null;
+  /** Service Worker へ送り終えた最後のサンプル時刻。 key = history のキー */
+  const sentT = new Map();
 
   // ------------------------------------------------------------- 受信
 
@@ -59,7 +67,10 @@
     store.set(frameId, { net: msg.net, player, host, at: now });
     record(frameId, host, msg.net, player, now);
 
-    if (!ticking) ticking = setInterval(render, RENDER_MS);
+    tick(RENDER_MS);
+    // ログの蓄積はトップフレームだけが行う。子フレームぶんも Service Worker が
+    // トップへ転送しているので、全フレームで送ると同じ行が二重に溜まる。
+    if (IS_TOP && !flushing) flushing = setInterval(flush, FLUSH_MS);
   });
 
   /** key が未登録で満杯なら、いちばん古い項目を捨てて枠を空ける（Map は挿入順） */
@@ -136,16 +147,27 @@
     render();
   });
 
-  chrome.storage.local.get(['collapsed', 'pos']).then((v) => {
+  chrome.storage.local.get('collapsed').then((v) => {
     collapsed = v.collapsed === true;
-    pos = v.pos || null;
     if (hud) applyState();
   });
+
+  /*
+   * 小窓の位置は storage.local に置かない。local は全タブ共通なので、片方のタブで
+   * 動かすと storage.onChanged が他のタブにも飛び、開いている小窓がいっせいに
+   * 同じ場所へ移動してしまう。位置は Service Worker がタブ単位で覚える。
+   */
+  chrome.runtime
+    .sendMessage({ __hlaChannel: CHANNEL, type: 'ui-get' })
+    .then((v) => {
+      pos = v?.pos || null;
+      if (hud) applyState();
+    })
+    .catch(() => {});
 
   chrome.storage.onChanged.addListener(async (changes, area) => {
     if (area !== 'local') return;
     if (changes.collapsed) collapsed = changes.collapsed.newValue === true;
-    if (changes.pos) pos = changes.pos.newValue || null;
     if (HLA_CONFIG.KEYS.some((k) => k in changes)) cfg = await HLA_CONFIG.load();
     if (hud) applyState();
     render();
@@ -169,7 +191,9 @@
     // 子フレームは全画面のときだけ出る（通常時はトップの小窓と二重になる）
     if (!IS_TOP && !fs) return false;
 
-    return live().length > 0;
+    // 配信が止まっても、履歴が残っているうちは閉じない。止まった瞬間に消えると
+    // 肝心の「落ちたときのログ」を保存できないまま小窓が無くなってしまう。
+    return live().length > 0 || history.size > 0;
   }
 
   function live() {
@@ -289,7 +313,7 @@
     function onUp(e) {
       handle.removeEventListener('pointermove', onMove);
       handle.releasePointerCapture(e.pointerId);
-      if (pos) chrome.storage.local.set({ pos });
+      if (pos) chrome.runtime.sendMessage({ __hlaChannel: CHANNEL, type: 'ui-set', pos }).catch(() => {});
     }
   }
 
@@ -300,10 +324,7 @@
 
     if (!show) {
       if (hostEl && hostEl.parentNode) hostEl.remove();
-      if (!store.size && ticking) {
-        clearInterval(ticking);
-        ticking = null;
-      }
+      if (!store.size) idle();
       return;
     }
 
@@ -322,11 +343,43 @@
       return r.html;
     });
 
-    body.innerHTML = html.join('') || '<div class="empty">no active stream</div>';
+    body.innerHTML = html.join('') || stopped();
 
     const alarm = hud.querySelector('.alarm');
     alarm.hidden = !(cfg.alerts && alarms > 0);
     alarm.textContent = alarms > 0 ? `⚠ ${alarms}` : '';
+
+    // 受信が途切れたら描画を緩める。小窓自体は履歴を保存できるよう残したまま。
+    if (!store.size) idle();
+  }
+
+  function stopped() {
+    if (!history.size) return '<div class="empty">no active stream</div>';
+    return '<div class="empty">配信が停止しました。<br>⤓ から、または設定画面からログを保存できます。</div>';
+  }
+
+  function tick(ms) {
+    if (tickMs === ms) return;
+    if (ticking) clearInterval(ticking);
+    tickMs = ms;
+    ticking = ms ? setInterval(render, ms) : null;
+  }
+
+  /*
+   * 受信が止まったあとの後始末。履歴が保持期間を過ぎて空になったら、そこで
+   * ようやく小窓を閉じてタイマーも止める。保存する時間は十分に残る。
+   */
+  function idle() {
+    prune();
+    tick(history.size ? IDLE_MS : 0);
+  }
+
+  function prune() {
+    const cutoff = Date.now() - cfg.historyMinutes * 60000;
+    for (const [k, h] of history) {
+      while (h.samples.length && h.samples[0].t < cutoff) h.samples.shift();
+      if (!h.samples.length) history.delete(k);
+    }
   }
 
   function renderStream(frameId, entry) {
@@ -509,75 +562,18 @@
 
   // ------------------------------------------------------------- エクスポート
 
-  const COLS = [
-    ['time_local', (m, s) => localStamp(s.t)],
-    ['time_iso', (m, s) => new Date(s.t).toISOString()],
-    ['host', (m) => m.host],
-    ['frame', (m) => m.frame],
-    ['mode', (m, s) => (s.live === true ? 'LIVE' : s.live === false ? 'VOD' : '')],
-    ['state', (m, s) => s.state],
-    ['width', (m, s) => s.w],
-    ['height', (m, s) => s.h],
-    ['fps', (m, s) => round(s.fps, 1)],
-    ['variant_index', (m, s) => (s.variantIndex != null ? s.variantIndex + 1 : null)],
-    ['variant_count', (m, s) => s.variantCount],
-    ['variant_bps', (m, s) => s.variantBps],
-    ['variant_resolution', (m, s) => s.variantRes],
-    ['codecs', (m, s) => s.codecs],
-    ['variant_switches', (m, s) => s.switches],
-    ['buffer_sec', (m, s) => round(s.bufferSec, 2)],
-    ['headroom', (m, s) => round(s.headroom, 2)],
-    ['download_bps', (m, s) => round(s.downloadBps, 0)],
-    ['segment_bytes', (m, s) => s.segBytes],
-    ['segment_download_ms', (m, s) => round(s.segMs, 0)],
-    ['segment_duration_sec', (m, s) => round(s.segDur, 3)],
-    ['target_duration_sec', (m, s) => s.targetDur],
-    ['live_latency_sec', (m, s) => round(s.latencySec, 2)],
-    ['stall_count', (m, s) => s.stalls],
-    ['stall_total_sec', (m, s) => round(s.stallSec, 2)],
-    ['freeze_count', (m, s) => s.freezes],
-    ['freeze_total_sec', (m, s) => round(s.freezeSec, 2)],
-    ['visible', (m, s) => (s.visible == null ? '' : s.visible ? 'true' : 'false')],
-    ['dropped_pct', (m, s) => round(s.droppedPct, 3)],
-    // 空欄は「判定できなかった」。false（実ダウンロード）と区別すること。
-    ['from_cache', (m, s) => (s.cached == null ? '' : s.cached ? 'true' : 'false')],
-    // 2回目以降のURL。キャッシュを判定できない配信ではこちらが手がかりになる。
-    ['segment_repeat', (m, s) => (s.repeat == null ? '' : s.repeat ? 'true' : 'false')],
-    ['playlist_reload_sec', (m, s) => round(s.plReloadSec, 2)],
-    ['http_errors', (m, s) => s.errors],
-  ];
-
-  function allRows() {
-    const rows = [];
-    for (const h of history.values()) for (const s of h.samples) rows.push({ meta: h.meta, s });
-    rows.sort((a, b) => a.s.t - b.s.t);
-    return rows;
-  }
-
   function exportFile(kind) {
-    const rows = allRows();
+    const rows = HLA_EXPORT.rows(history.values());
     if (!rows.length) {
       note('まだ履歴がありません');
       return;
     }
 
-    let text;
-    let mime;
-    if (kind === 'csv') {
-      const lines = [COLS.map((c) => c[0]).join(',')];
-      for (const { meta, s } of rows) lines.push(COLS.map((c) => csvCell(c[1](meta, s))).join(','));
-      // BOM(U+FEFF) + CRLF。Excel で開いたときに文字化けせず、行も崩れない。
-      text = '﻿' + lines.join('\r\n');
-      mime = 'text/csv;charset=utf-8';
-    } else {
-      const out = rows.map(({ meta, s }) => Object.fromEntries(COLS.map((c) => [c[0], c[1](meta, s) ?? null])));
-      text = JSON.stringify(out, null, 1);
-      mime = 'application/json';
-    }
+    const { text, mime } = HLA_EXPORT.build(rows, kind);
 
     /*
      * ページの DOM に <a href="blob:..."> を挿してクリックする方法は使わない。
-     * blob URL はページの origin で発行されるので、ページ側が MutationObserver で
+     * blob URLはページの origin で発行されるので、ページ側が MutationObserver で
      * href を拾えば、収集した履歴をそのまま読み取れてしまう。計測対象のサイト自身に
      * 品質ログを渡すことになる。Service Worker の chrome.downloads に投げれば、
      * ページ側からは保存の事実すら見えない。
@@ -587,7 +583,7 @@
         __hlaChannel: CHANNEL,
         type: 'download',
         url: dataUrl(text, mime),
-        filename: `hls-${fileStamp()}.${kind}`,
+        filename: `hls-${HLA_EXPORT.fileStamp()}.${kind}`,
       })
       .then((res) => {
         if (res && res.ok) note(`${rows.length} 行を書き出しました`);
@@ -607,33 +603,46 @@
     return `data:${mime};base64,${btoa(bin)}`;
   }
 
-  function csvCell(v) {
-    if (v == null) return '';
-    const s = String(v);
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  // ------------------------------------------------------- ログの送出
+
+  /*
+   * 小窓が持つ履歴はページのメモリ上にあるだけで、タブを閉じれば消える。配信が
+   * 止まった直後や、そのままタブを閉じたあとでも保存できるよう、新しく積んだぶんを
+   * Service Worker へ送って storage.session に残す。保持はブラウザを閉じるまで。
+   */
+  function flush() {
+    if (!IS_TOP) return;
+
+    const streams = [];
+    for (const [key, h] of history) {
+      const last = sentT.get(key) ?? 0;
+      const samples = h.samples.filter((s) => s.t > last);
+      if (!samples.length) continue;
+      sentT.set(key, samples[samples.length - 1].t);
+      // 履歴のキーは frameId（数値）。送る側では文字列に揃えておく。
+      streams.push({ key: String(key), meta: h.meta, samples });
+    }
+    // 履歴側で捨てられたキーの目印は残しておかない
+    for (const k of sentT.keys()) if (!history.has(k)) sentT.delete(k);
+
+    if (!streams.length) return;
+    chrome.runtime
+      .sendMessage({
+        __hlaChannel: CHANNEL,
+        type: 'log-append',
+        host: location.host || 'page',
+        title: document.title || '',
+        url: location.origin + location.pathname,
+        streams,
+      })
+      .catch(() => {});
   }
 
-  function round(v, digits) {
-    return typeof v === 'number' && Number.isFinite(v) ? +v.toFixed(digits) : null;
-  }
-
-  function pad(n, w = 2) {
-    return String(n).padStart(w, '0');
-  }
-
-  /** Excel がそのまま日時として解釈できる形式 */
-  function localStamp(t) {
-    const d = new Date(t);
-    return (
-      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
-      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
-    );
-  }
-
-  function fileStamp() {
-    const d = new Date();
-    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  }
+  // タブを閉じる / 別ページへ移る直前に、残りを送り切る
+  addEventListener('pagehide', flush);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flush();
+  });
 
   // ------------------------------------------------------------- 整形
 

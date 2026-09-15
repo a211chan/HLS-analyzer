@@ -127,7 +127,17 @@ stall と HTTPエラーは累積値ではなく**増分**で判定する。累�
 | `visible` | タブが表示されていたか。`false` の区間で `fps` が 0 でも異常ではない |
 | `segment_duration_sec` | 余裕度の計算に**実際に使った**尺。セグメント個別の `#EXTINF` が取れればその値 |
 
-履歴はメモリ上にのみ持つ。ページを離れると消えるので、**書き出しは再生中に行うこと**。既定の保持時間は30分。
+小窓が持つ履歴はページのメモリ上にあり、ページを離れると消える。既定の保持時間は30分。
+
+### ログの取り置き
+
+小窓が集めたログは、数秒ごとに Service Worker へ送られ `chrome.storage.session` にタブ単位で溜まる。**配信が止まったあとでも、タブを閉じたあとでも、設定画面の「ログ」から CSV / JSON を保存できる**。列は `⤓` からの書き出しとまったく同じ。
+
+小窓も、再生が止まった瞬間に消えたりはしない。履歴が残っているうちは開いたままで、その場で書き出せる。
+
+保持は**ブラウザを閉じるまで**。`storage.session` はメモリ上の領域で、ディスクには書かれない。古いログが溜まり続けてゴミにならないよう、意図的にここで区切ってある。上限は 1タブ 6000 行 / 8タブぶんで、超えると古い側から捨てる。
+
+小窓の位置も同じく `storage.session` にタブ単位で持つ。複数のタブで計測しているとき、片方を動かしても他のタブの小窓は動かない。
 
 ## 構成
 
@@ -139,9 +149,12 @@ src/content/bridge.js        ISOLATED / 全フレーム / document_start
                              上り: メトリクスを Service Worker へ中継
                              下り: 更新間隔を MAIN world へ postMessage
 src/bg/sw.js                 Service Worker
+                             フレーム間の中継、ログの蓄積（storage.session）、
+                             小窓の位置のタブ単位の記憶
 src/content/overlay.js       HUD 描画・履歴保持・スパークライン・エクスポート
 src/content/overlay-style.js Shadow DOM に注入する HUD のスタイル
 src/common/config.js         設定の既定値とマージ処理
+src/common/export.js         CSV / JSON の列定義と組み立て（オーバーレイと設定画面が共有）
 src/options/                 設定画面
 test/                        検証用ページ（後述）
 ```
@@ -210,7 +223,7 @@ document.querySelector('[data-hla]').shadowRoot.querySelector('.hud')
 
 - **URL の拡張子で判別している**。`.m3u8` / `.ts` / `.m4s` / `.mp4` などを見ているため、拡張子を持たない署名付きURLや、クエリでセグメントを出し分けるCDNでは取りこぼす（[#1](https://github.com/a211chan/HLS-analyzer/issues/1)）
 - **1フレームに複数のHLS再生があると、いちばん大きい `<video>` を代表として表示する**。ネットワーク側の集計はフレーム単位なので、複数ストリームが混ざる
-- **履歴はページを離れると消える**
+- **ログはブラウザを閉じると消える**。`chrome.storage.session` に置いており、ディスクには残さない（意図的な設計）
 - **`<video>` 要素そのものがフルスクリーンの場合は重ねられない**。video は子要素を描画しないため
 - **Safari のネイティブHLS再生には使えない**。取得がブラウザ内部で行われ JS から見えない。Chrome デスクトップでは該当しない
 - **LL-HLS の部分セグメント（`#EXT-X-PART`）は未対応**。余裕度の分母がセグメント尺のままになり、ライブ遅延の精度も出ない（[#2](https://github.com/a211chan/HLS-analyzer/issues/2)）
@@ -223,7 +236,7 @@ document.querySelector('[data-hla]').shadowRoot.querySelector('.hud')
 
 - **セグメント／プレイリストのURLは外に出さない**。署名付きトークンを含みうるため、URL は収集層のメモリ内に留め、小窓にもエクスポートにも載せない
 - **メディアの中身は保持しない**。セグメントはバイト数を数えながら読み捨てる
-- `chrome.storage.local` に保存するのは設定と小窓の位置だけ。計測履歴はメモリ上にのみ置き、ページを離れると消える
+- `chrome.storage.local`（ディスク）に保存するのは設定だけ。小窓の位置と計測ログは `chrome.storage.session`（メモリ）に置き、ブラウザを閉じると消える
 - エクスポートは `chrome.downloads` 経由で行う。ページ側から書き出し内容は読めない
 
 なお、HLS の利用有無を事前に判別できないため、コンテンツスクリプトは全ページ・全フレームに注入される。`.m3u8` を一度も踏んでいないページではポーリングを行わない。
