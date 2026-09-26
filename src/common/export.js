@@ -40,6 +40,8 @@
     ['buffer_sec', (m, s) => round(s.bufferSec, 2)],
     ['headroom', (m, s) => round(s.headroom, 2)],
     ['download_bps', (m, s) => round(s.downloadBps, 0)],
+    // 直近の取得が init（#EXT-X-MAP）だったか。init は余裕度・DL速度の計算に使わない
+    ['segment_kind', (m, s) => s.segKind],
     ['segment_bytes', (m, s) => s.segBytes],
     ['segment_download_ms', (m, s) => round(s.segMs, 0)],
     ['segment_duration_sec', (m, s) => round(s.segDur, 3)],

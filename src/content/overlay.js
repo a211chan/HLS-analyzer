@@ -121,6 +121,7 @@
       codecs: net.codecs,
       switches: net.switches,
       downloadBps: net.downloadBps,
+      segKind: net.segKind,
       segBytes: net.segBytes,
       segMs: net.segMs,
       segDur: net.segDur,

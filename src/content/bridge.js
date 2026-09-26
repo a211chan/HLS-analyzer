@@ -88,6 +88,7 @@
       cached: bool(n.cached),
       repeat: bool(n.repeat),
       downloadBps: num(n.downloadBps),
+      segKind: n.segKind === 'init' || n.segKind === 'segment' ? n.segKind : null,
       segBytes: num(n.segBytes),
       segMs: num(n.segMs),
       headroom: num(n.headroom),

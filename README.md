@@ -18,6 +18,25 @@ WebRTC には `RTCPeerConnection.getStats()` という標準の統計APIがあ�
 
 Chrome デスクトップは `<video>` のネイティブHLS再生に対応しないため、HLS は必ず JS プレーヤーが MSE 経由で再生する。つまり `fetch` / `XHR` を押さえれば取りこぼしが無い。
 
+### どの取得がセグメントかの判別
+
+URL の拡張子だけに頼ると、拡張子を持たない署名付きURL（`/seg/12345?token=...`）やパッケージャ出力を取りこぼす。取りこぼすと DL速度・余裕度・segment・HTTPエラーだけが空欄になり、`<video>` 由来の値は出るので「部分的に動いている」ように見えて紛らわしい。そこで3段で判別している。
+
+| 順 | 手がかり | 補足 |
+|---|---|---|
+| 1 | **プレイリストに載っているURLか** | 解析済みのメディアプレイリストから「URL → 種別・尺・どのプレイリストか」の索引を作って照合する。完全一致で無ければクエリを落として照合（後からトークンを足すプレーヤー / CDN 対策） |
+| 2 | URL の拡張子 | プレイリストを読む前の取得用。`.m3u8` / `.ts` / `.m4s` / `.mp4` など |
+| 3 | レスポンスの `Content-Type` | `application/vnd.apple.mpegurl`、`video/mp2t`、`video/mp4` など。`application/octet-stream` だけでは判定しない（CDN の既定値として多すぎる） |
+
+1・2 で決まらない取得は、ヘッダ到着時に 3 を一度だけ見る。本文を読むのは判定が当たったものだけなので、HLS と無関係な取得のコストはヘッダを1回見るだけで済む。
+
+索引はプレイリストを読むたびに作り直す（LIVE で流れていった古いURLは自然に消える）。上限は2000件。
+
+あわせて次の2つを扱う。
+
+- **`#EXT-X-MAP` の init セグメント** — fMP4 の初期化データで、尺を持たない。拡張子（`.mp4`）で拾うと尺の無いセグメントとしてプレイリストの代表尺で割られ、余裕度が狂う。`init` として区別し、DL速度・余裕度の計算から外す
+- **`#EXT-X-BYTERANGE`** — 1ファイルを Range で分割取得する配信。URL だけで「2回目の取得か」を見ると2本目以降が全部「再取得（キャッシュ扱い）」になり計測から外れてしまうので、URL＋範囲で区別する
+
 ## インストール
 
 1. Chrome で `chrome://extensions` を開く
@@ -113,7 +132,7 @@ stall と HTTPエラーは累積値ではなく**増分**で判定する。累�
 
 ## エクスポート
 
-`⤓` から CSV / JSON を書き出す。1行 = 1サンプルで33項目。CSV は **BOM 付き UTF-8 + CRLF**、`time_local` 列にローカル時刻が入るので Excel でそのまま開ける。
+`⤓` から CSV / JSON を書き出す。1行 = 1サンプルで34項目。CSV は **BOM 付き UTF-8 + CRLF**、`time_local` 列にローカル時刻が入るので Excel でそのまま開ける。
 
 読むときに注意が要る列。
 
@@ -123,6 +142,7 @@ stall と HTTPエラーは累積値ではなく**増分**で判定する。累�
 | `from_cache` | 3値。`true` / `false` / **空欄は「判定できなかった」** |
 | `segment_repeat` | 同じセグメントURLの2回目以降か。`from_cache` が空欄のときの手がかり |
 | `visible` | タブが表示されていたか。`false` の区間で `fps` が 0 でも異常ではない |
+| `segment_kind` | 直近の取得が `segment` か `init`（`#EXT-X-MAP`）か。`init` の行では `segment_bytes` 等は直前のセグメントの値のまま |
 | `segment_duration_sec` | 余裕度の計算に**実際に使った**尺。セグメント個別の `#EXTINF` が取れればその値 |
 
 小窓から書き出せるのは、そのページで保持している直近30分（設定で変更可）。
@@ -182,7 +202,7 @@ PRIVACY.md                   プライバシーポリシー（ストアから参
 ./test/make-stream.sh 48
 ```
 
-720p/3000k・480p/1500k・360p/650k の VOD が `test/stream/` に生成される（git管理外）。
+720p/3000k・480p/1500k・360p/650k の VOD が `test/stream/` に、fMP4（`#EXT-X-MAP` 付き）の単一バリアントが `test/stream-fmp4/` に生成される（どちらも git管理外）。
 
 ### サーバの起動
 
@@ -197,6 +217,17 @@ python3 test/serve.py
 | http://localhost:8732/test/loopback.html | 拡張を読み込んだ状態で開く。右上に小窓が出れば成功 |
 | http://localhost:8732/test/standalone.html | 拡張なしで収集と描画だけを検証（`test/shim.js` が chrome.* を代替） |
 | http://localhost:8732/test/options-preview.html | 拡張なしで設定画面を検証 |
+
+loopback / standalone は `?src=` で配信形態を切り替えられる（セグメント判別の検証用）。
+
+| `?src=` | 配信形態 | 確認すること |
+|---|---|---|
+| （なし） | 通常の `.m3u8` / `.ts` | — |
+| `noext` | 拡張子なしURL。セグメントは `?token=` 付き・`application/octet-stream` | 索引での照合だけで DL速度・余裕度・variant が出る |
+| `byterange` | バリアントごとに1ファイルを `#EXT-X-BYTERANGE` で分割 | 2本目以降も「再取得」扱いにならず計測される |
+| `fmp4` | fMP4。`#EXT-X-MAP` の init を持つ | init が余裕度・DL速度に混ざらない |
+
+`noext` / `byterange` は `test/serve.py` が `test/stream/` から都度組み立てて返す（`/hls/<mode>/master`）。
 
 バリアントのボタンで切替を起こせる。「video を直接全画面」ボタンは、`<video>` 要素そのものを全画面にするプレーヤーの再現用（`⧉` の確認に使う）。`window.__hls` から hls.js のインスタンスを直接触れる。
 
@@ -224,7 +255,8 @@ document.querySelector('[data-hla]').shadowRoot.querySelector('.hud')
 
 ## 既知の制限
 
-- **URL の拡張子で判別している**。`.m3u8` / `.ts` / `.m4s` / `.mp4` などを見ているため、拡張子を持たない署名付きURLや、クエリでセグメントを出し分けるCDNでは取りこぼす（[#1](https://github.com/a211chan/HLS-analyzer/issues/1)）
+- **拡張子も無く、`Content-Type` も汎用（`application/octet-stream`）で、かつプレイリストを読む前に取得されたセグメントは取りこぼす**。プレイリストを読んだ後は索引で照合できるので、実際に落ちるのは再生開始直後の数本に限られる
+- **拡張子の無いマスター / メディアプレイリストを `Content-Type` 無しで返す配信には対応しない**。プレイリストを読めないと索引も作れない
 - **1フレームに複数のHLS再生があると、いちばん大きい `<video>` を代表として表示する**。ネットワーク側の集計はフレーム単位なので、複数ストリームが混ざる
 - **`<video>` 要素そのものがフルスクリーンの場合、ページ内の小窓は消える**。video は子要素を描画しないため。全画面にする前に `⧉` で別ウィンドウに出しておけば見える（`requestWindow()` はユーザー操作起点でしか呼べないので、全画面後には開けない）
 - **Safari のネイティブHLS再生には使えない**。取得がブラウザ内部で行われ JS から見えない。Chrome デスクトップでは該当しない
