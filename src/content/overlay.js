@@ -26,8 +26,6 @@
    * ページ側は iframe を大量に作れば別の frameId を無限に増やせる。頭打ちにする。
    */
   const MAX_FRAMES = 24;
-  /** 溜めたログを Service Worker へ送る間隔(ms) */
-  const FLUSH_MS = 3000;
 
   let cfg = structuredClone(HLA_CONFIG.DEFAULTS);
 
@@ -44,9 +42,9 @@
   let menuEl = null;
   let ticking = null;
   let tickMs = 0;
-  let flushing = null;
-  /** Service Worker へ送り終えた最後のサンプル時刻。 key = history のキー */
-  const sentT = new Map();
+  /** Document Picture-in-Picture で開いた別ウィンドウ。null なら通常のページ内表示 */
+  let pipWin = null;
+  const CAN_PIP = IS_TOP && 'documentPictureInPicture' in window;
 
   // ------------------------------------------------------------- 受信
 
@@ -68,9 +66,6 @@
     record(frameId, host, msg.net, player, now);
 
     tick(RENDER_MS);
-    // ログの蓄積はトップフレームだけが行う。子フレームぶんも Service Worker が
-    // トップへ転送しているので、全フレームで送ると同じ行が二重に溜まる。
-    if (IS_TOP && !flushing) flushing = setInterval(flush, FLUSH_MS);
   });
 
   /** key が未登録で満杯なら、いちばん古い項目を捨てて枠を空ける（Map は挿入順） */
@@ -137,7 +132,47 @@
 
     const cutoff = now - cfg.historyMinutes * 60000;
     while (h.samples.length && h.samples[0].t < cutoff) h.samples.shift();
+
+    // 永続化はトップフレームだけが行う。子フレームぶんも Service Worker が
+    // トップへ転送しているので、全フレームで書くと同じ行が二重に溜まる。
+    if (IS_TOP && cfg.persist) {
+      const key = String(frameId);
+      persist.metas[key] = h.meta;
+      persist.rows.push([key, h.samples[h.samples.length - 1]]);
+      if (!persist.timer) persist.timer = setTimeout(flush, PERSIST_MS);
+    }
   }
+
+  // ------------------------------------------------------------- 永続化
+
+  /*
+   * 履歴はメモリ上にもあるが、ページを離れると消える。障害に気づいた時点で
+   * 再生し直していても事後に追えるよう、トップフレームだけが一定間隔で
+   * chrome.storage.local へ差分を書き足す（子フレームのぶんもトップに集約済み）。
+   * 1ページ = 1セッション。一覧とエクスポートは設定画面から行う。
+   */
+  const PERSIST_MS = 10000;
+  const persist = { session: null, metas: {}, rows: [], timer: null };
+
+  function flush() {
+    clearTimeout(persist.timer);
+    persist.timer = null;
+    if (!persist.rows.length) return;
+    if (!persist.session) {
+      persist.session = { id: HLA_EXPORT.newSessionId(), host: location.host || 'page', start: Date.now(), end: 0, rows: 0, chunks: 0 };
+      // 新しいセッションを始めるついでに、保持期限を過ぎたものを掃除する
+      HLA_EXPORT.prune(cfg.persistHours).catch(() => {});
+    }
+    const { metas, rows } = persist;
+    persist.metas = {};
+    persist.rows = [];
+    HLA_EXPORT.writeChunk(persist.session, metas, rows).catch(() => {
+      // 拡張の再読み込み直後など。取りこぼしは許容する（メモリ上の履歴は残っている）
+    });
+  }
+
+  // 離脱時に残りを書く。完了を待てないので最善努力
+  addEventListener('pagehide', flush);
 
   // ------------------------------------------------------------- 設定
 
@@ -183,10 +218,13 @@
 
   function shouldShow() {
     if (!cfg.enabled) return false;
+    // 別ウィンドウに出しているあいだはページの全画面状態に左右されない
+    if (pipWin) return live().length > 0 || history.size > 0;
 
     const fs = fullscreenEl();
     // <video> や <iframe> は子要素を描画しないので、その上には重ねられない。
     // iframe が全画面なら、その iframe 自身のオーバーレイが担当する。
+    // <video> の場合はどのフレームからも重ねられないので、⧉ で別ウィンドウに出してもらう。
     if (fs && (fs.tagName === 'VIDEO' || fs.tagName === 'IFRAME')) return false;
     // 子フレームは全画面のときだけ出る（通常時はトップの小窓と二重になる）
     if (!IS_TOP && !fs) return false;
@@ -223,6 +261,7 @@
       <header>
         <span class="title">HLS Analyzer</span>
         <span class="alarm" hidden></span>
+        ${CAN_PIP ? '<button data-act="pip" title="別ウィンドウに出す（動画を直接全画面にするプレーヤーでも見える）">⧉</button>' : ''}
         <button data-act="export"   title="エクスポート">⤓</button>
         <button data-act="options"  title="設定">⚙</button>
         <button data-act="collapse" title="折りたたみ">–</button>
@@ -257,11 +296,12 @@
     else if (act === 'close') chrome.storage.local.set({ enabled: false });
     else if (act === 'options') chrome.runtime.sendMessage({ __hlaChannel: CHANNEL, type: 'open-options' });
     else if (act === 'export') menuEl.hidden = !menuEl.hidden;
+    else if (act === 'pip') togglePip();
     else if (act === 'csv') exportFile('csv');
     else if (act === 'json') exportFile('json');
     else if (act === 'clear') {
       history.clear();
-      note('履歴をクリアしました');
+      note('履歴をクリアしました（保存済みの履歴は設定画面から消せます）');
     }
   }
 
@@ -272,11 +312,46 @@
     note.t = setTimeout(() => (el.textContent = ''), 4000);
   }
 
+  /*
+   * Document Picture-in-Picture。<video> 要素そのものが全画面になると、
+   * video は子要素を描画しないためページ内のどこにも小窓を重ねられない。
+   * 常に最前面に出る別ウィンドウへ小窓ごと移しておけば、全画面の上にも見える。
+   * requestWindow() はユーザー操作起点でしか呼べないので、ボタンで開く。
+   */
+  async function togglePip() {
+    if (pipWin) {
+      pipWin.close();
+      return;
+    }
+    try {
+      const w = await documentPictureInPicture.requestWindow({ width: 320, height: 460 });
+      w.document.title = 'HLS Analyzer';
+      w.document.body.style.cssText = 'margin:0;background:#121418;';
+      // 閉じられたらページ内の表示に戻す
+      w.addEventListener('pagehide', () => {
+        pipWin = null;
+        hud.classList.remove('pip');
+        applyState();
+        render();
+      });
+      pipWin = w;
+      hud.classList.add('pip');
+      menuEl.hidden = true;
+      applyState();
+      render();
+    } catch (_) {
+      note('別ウィンドウを開けませんでした');
+    }
+  }
+
   function applyState() {
     hud.classList.toggle('collapsed', collapsed);
     hud.classList.toggle('spark', !!cfg.sparkline);
     if (collapsed) menuEl.hidden = true;
-    if (pos) {
+    if (pipWin) {
+      // 別ウィンドウ内ではウィンドウ自体を動かすので、位置指定は使わない
+      hud.style.left = hud.style.top = hud.style.right = '';
+    } else if (pos) {
       hud.style.left = clamp(pos.left, 0, Math.max(0, innerWidth - 120)) + 'px';
       hud.style.top = clamp(pos.top, 0, Math.max(0, innerHeight - 28)) + 'px';
       hud.style.right = 'auto';
@@ -296,7 +371,7 @@
     let dy = 0;
 
     handle.addEventListener('pointerdown', (e) => {
-      if (e.target.tagName === 'BUTTON') return;
+      if (e.target.tagName === 'BUTTON' || pipWin) return;
       const r = hud.getBoundingClientRect();
       dx = e.clientX - r.left;
       dy = e.clientY - r.top;
@@ -331,7 +406,7 @@
     if (!hostEl) build();
 
     // フルスクリーン要素があればその配下へ移す（トップレイヤーに入れるため）
-    const parent = fullscreenEl() || document.documentElement;
+    const parent = pipWin ? pipWin.document.body : fullscreenEl() || document.documentElement;
     if (hostEl.parentNode !== parent) parent.appendChild(hostEl);
 
     const entries = live().sort((a, b) => a[1].host.localeCompare(b[1].host));
@@ -355,7 +430,7 @@
 
   function stopped() {
     if (!history.size) return '<div class="empty">no active stream</div>';
-    return '<div class="empty">配信が停止しました。<br>⤓ から、または設定画面からログを保存できます。</div>';
+    return '<div class="empty">配信が停止しました。<br>⤓ から、または設定画面の「保存済みの履歴」から書き出せます。</div>';
   }
 
   function tick(ms) {
@@ -582,7 +657,7 @@
       .sendMessage({
         __hlaChannel: CHANNEL,
         type: 'download',
-        url: dataUrl(text, mime),
+        url: HLA_EXPORT.dataUrl(text, mime),
         filename: `hls-${HLA_EXPORT.fileStamp()}.${kind}`,
       })
       .then((res) => {
@@ -591,58 +666,6 @@
       })
       .catch(() => note('保存できませんでした。拡張を再読み込みしてください'));
   }
-
-  /** UTF-8 の文字列を data: URL にする。chrome.downloads は data: を受け付ける */
-  function dataUrl(text, mime) {
-    const bytes = new TextEncoder().encode(text);
-    let bin = '';
-    // 一度に渡すと引数が多すぎて RangeError になるので分割して詰める
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    }
-    return `data:${mime};base64,${btoa(bin)}`;
-  }
-
-  // ------------------------------------------------------- ログの送出
-
-  /*
-   * 小窓が持つ履歴はページのメモリ上にあるだけで、タブを閉じれば消える。配信が
-   * 止まった直後や、そのままタブを閉じたあとでも保存できるよう、新しく積んだぶんを
-   * Service Worker へ送って storage.session に残す。保持はブラウザを閉じるまで。
-   */
-  function flush() {
-    if (!IS_TOP) return;
-
-    const streams = [];
-    for (const [key, h] of history) {
-      const last = sentT.get(key) ?? 0;
-      const samples = h.samples.filter((s) => s.t > last);
-      if (!samples.length) continue;
-      sentT.set(key, samples[samples.length - 1].t);
-      // 履歴のキーは frameId（数値）。送る側では文字列に揃えておく。
-      streams.push({ key: String(key), meta: h.meta, samples });
-    }
-    // 履歴側で捨てられたキーの目印は残しておかない
-    for (const k of sentT.keys()) if (!history.has(k)) sentT.delete(k);
-
-    if (!streams.length) return;
-    chrome.runtime
-      .sendMessage({
-        __hlaChannel: CHANNEL,
-        type: 'log-append',
-        host: location.host || 'page',
-        title: document.title || '',
-        url: location.origin + location.pathname,
-        streams,
-      })
-      .catch(() => {});
-  }
-
-  // タブを閉じる / 別ページへ移る直前に、残りを送り切る
-  addEventListener('pagehide', flush);
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flush();
-  });
 
   // ------------------------------------------------------------- 整形
 

@@ -75,6 +75,8 @@
     $('intervalMs').value = cfg.intervalMs;
     $('sparkSeconds').value = cfg.sparkSeconds;
     $('historyMinutes').value = cfg.historyMinutes;
+    $('persist').checked = !!cfg.persist;
+    $('persistHours').value = cfg.persistHours;
     $('sparkline').checked = !!cfg.sparkline;
     $('alerts').checked = !!cfg.alerts;
 
@@ -88,6 +90,7 @@
 
     // スパークラインOFFなら範囲指定は意味がない
     $('sparkSeconds').disabled = !cfg.sparkline;
+    $('persistHours').disabled = !cfg.persist;
   }
 
   // ------------------------------------------------------------ 収集と保存
@@ -98,6 +101,8 @@
     next.intervalMs = clampInt($('intervalMs').value, 200, 10000, DEFAULTS.intervalMs);
     next.sparkSeconds = clampInt($('sparkSeconds').value, 10, 600, DEFAULTS.sparkSeconds);
     next.historyMinutes = clampInt($('historyMinutes').value, 1, 240, DEFAULTS.historyMinutes);
+    next.persist = $('persist').checked;
+    next.persistHours = clampInt($('persistHours').value, 1, 720, DEFAULTS.persistHours);
     next.sparkline = $('sparkline').checked;
     next.alerts = $('alerts').checked;
 
@@ -138,113 +143,57 @@
     return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   }
 
-  // ------------------------------------------------------------ ログ
+  // ------------------------------------------------------------ 保存済みの履歴
 
-  /*
-   * 小窓が集めたログは Service Worker が chrome.storage.session に溜めている。
-   * 設定画面は拡張のページなので、そこから直接読めばよい（コンテンツスクリプトは
-   * session 領域に触れないため、溜める側だけが SW を経由している）。
-   *
-   * session 領域はブラウザを閉じると消える。ログがディスクに溜まり続けて
-   * ゴミにならないよう、保持期間はそこまでと決めてある。
-   */
-  const LOG_INDEX = 'logIndex';
-  const LOG_KEY = (tabId) => `log:${tabId}`;
+  const { listSessions, loadRows, removeSessions, build, dataUrl, fileStamp, localStamp } = HLA_EXPORT;
+  let sessions = [];
 
-  async function loadLogs() {
-    const all = (await chrome.storage.session.get(LOG_INDEX))[LOG_INDEX] || {};
-    return Object.values(all).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  }
-
-  async function paintLogs() {
-    const list = await loadLogs();
-    const el = $('logs');
-
-    if (!list.length) {
-      el.innerHTML = '<div class="logs-empty">まだログがありません。計測が始まると自動で溜まります。</div>';
+  async function paintSessions() {
+    sessions = await listSessions();
+    const tbody = document.querySelector('#sessions tbody');
+    if (!sessions.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="desc">まだありません</td></tr>';
       return;
     }
-
-    el.innerHTML = list
+    tbody.innerHTML = sessions
       .map(
-        (e) => `
-      <div class="log" data-tab="${escapeHtml(String(e.tabId))}">
-        <div class="log-main">
-          <span class="log-host">${escapeHtml(e.host || 'page')}</span>
-          <span class="log-title">${escapeHtml(e.title || '')}</span>
-        </div>
-        <div class="log-meta">${escapeHtml(span(e))} · ${escapeHtml(String(e.rows || 0))} 行</div>
-        <div class="log-acts">
-          <button data-dl="csv">CSV</button>
-          <button data-dl="json">JSON</button>
-          <button data-del="1" class="danger">削除</button>
-        </div>
-      </div>`
+        (s, i) => `
+      <tr>
+        <td>${escapeHtml(localStamp(s.start).slice(0, 19))}</td>
+        <td>${escapeHtml(localStamp(s.end).slice(0, 19))}</td>
+        <td class="name">${escapeHtml(s.host)}</td>
+        <td>${s.rows}</td>
+        <td class="ops">
+          <button data-sess="${i}" data-op="csv">CSV</button>
+          <button data-sess="${i}" data-op="json">JSON</button>
+          <button data-sess="${i}" data-op="del" class="danger">削除</button>
+        </td>
+      </tr>`
       )
       .join('');
   }
 
-  function span(e) {
-    const from = e.startedAt ? clock(e.startedAt) : '';
-    const to = e.updatedAt ? clock(e.updatedAt) : '';
-    return from && to ? `${from} → ${to}` : from || to || '';
-  }
-
-  function clock(t) {
-    const d = new Date(t);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-  }
-
-  async function downloadLog(tabId, kind) {
-    const key = LOG_KEY(tabId);
-    const log = (await chrome.storage.session.get(key))[key];
-    const rows = log ? HLA_EXPORT.rows(Object.values(log.streams || {})) : [];
-    if (!rows.length) {
-      logFlash('このログは既に消えています');
-      await paintLogs();
+  async function onSession(e) {
+    const btn = e.target.closest('[data-sess]');
+    if (!btn) return;
+    const s = sessions[Number(btn.dataset.sess)];
+    if (!s) return;
+    const op = btn.dataset.op;
+    if (op === 'del') {
+      await removeSessions([s]);
+      await paintSessions();
+      flash('削除しました');
       return;
     }
-
-    const { text, mime } = HLA_EXPORT.build(rows, kind);
-    // ここは拡張のページなので blob URL も拡張の origin で発行される。
-    // 計測対象のページからは見えない。
-    const url = URL.createObjectURL(new Blob([text], { type: mime }));
-    try {
-      await chrome.downloads.download({
-        url,
-        filename: `hls-${HLA_EXPORT.fileStamp(log.startedAt || Date.now())}.${kind}`,
-        saveAs: false,
-      });
-      logFlash(`${rows.length} 行を書き出しました`);
-    } catch (e) {
-      logFlash(`保存できませんでした: ${String(e?.message || e)}`);
+    const rows = await loadRows(s);
+    if (!rows.length) {
+      flash('データがありません');
+      return;
     }
-    // 保存の開始後すぐに revoke すると取りこぼすので少し待つ
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-  }
-
-  async function removeLog(tabId) {
-    const all = (await chrome.storage.session.get(LOG_INDEX))[LOG_INDEX] || {};
-    delete all[tabId];
-    await chrome.storage.session.set({ [LOG_INDEX]: all });
-    await chrome.storage.session.remove(LOG_KEY(tabId));
-    await paintLogs();
-  }
-
-  async function clearLogs() {
-    const list = await loadLogs();
-    await chrome.storage.session.remove([LOG_INDEX, ...list.map((e) => LOG_KEY(e.tabId))]);
-    await paintLogs();
-    logFlash('ログを削除しました');
-  }
-
-  function logFlash(text) {
-    const el = $('logs-status');
-    el.textContent = text;
-    el.classList.add('on');
-    clearTimeout(logFlash.t);
-    logFlash.t = setTimeout(() => el.classList.remove('on'), 2600);
+    const { text, mime } = build(rows, op);
+    // 設定画面は拡張のページなので chrome.downloads を直接呼べる
+    await chrome.downloads.download({ url: dataUrl(text, mime), filename: `hls-${fileStamp(s.start)}.${op}`, saveAs: false });
+    flash(`${rows.length} 行を書き出しました`);
   }
 
   // ------------------------------------------------------------ 起動
@@ -254,7 +203,7 @@
     buildThresholds();
     cfg = merge(await chrome.storage.local.get(KEYS));
     paint();
-    paintLogs();
+    await paintSessions();
 
     document.addEventListener('change', (e) => {
       if (e.target.matches('input')) save();
@@ -267,20 +216,13 @@
       flash('既定値に戻しました');
     });
 
-    $('logs').addEventListener('click', (e) => {
-      const row = e.target.closest?.('.log');
-      if (!row) return;
-      const tabId = row.dataset.tab;
-      const kind = e.target.dataset?.dl;
-      if (kind) downloadLog(tabId, kind);
-      else if (e.target.dataset?.del) removeLog(tabId);
-    });
-
-    $('logs-clear').addEventListener('click', clearLogs);
-
-    // 計測中のタブがあれば行数が伸び続ける。開きっぱなしの設定画面も追従させる。
-    chrome.storage.session.onChanged?.addListener((changes) => {
-      if (LOG_INDEX in changes) paintLogs();
+    document.querySelector('#sessions').addEventListener('click', onSession);
+    $('refreshSessions').addEventListener('click', paintSessions);
+    $('clearSessions').addEventListener('click', async () => {
+      if (!confirm('保存済みの履歴をすべて削除しますか？')) return;
+      await removeSessions(await listSessions());
+      await paintSessions();
+      flash('すべて削除しました');
     });
   })();
 })();

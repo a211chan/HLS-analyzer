@@ -1,24 +1,8 @@
-# HLS Analyzer
+![HLS Analyzer](store/images/promo-marquee-1400x560.png)
 
 視聴中のページの上に小窓（HUD）を重ね、HLS の再生品質をリアルタイム表示する Chrome 拡張。
 
 [WebRTC Analyzer](https://github.com/a211chan/WebRTC-analyzer) から派生。小窓・エクスポート・設定画面の作りは共通で、収集層とメトリクスが HLS 用に入れ替わっている。
-
-```
-HLS ANALYZER                 ⚠ 1  ⤓ ⚙ – ×
-example.com · LIVE                 playing
-↓ HLS 1280x720               avc1 / mp4a
-  variant   ╭──╮╭─╮      3/3 · 3.03 Mbps
-  解像度                        1280×720
-  fps       ────────              30 fps
-  buffer    ╰─╮╭──╮                8.2 s
-  余裕度    ─╮╰╯                    ×3.4
-  DL速度    ╭╮╭──╮              9.8 Mbps
-  segment                 1.42 MB / 1180 ms
-  ライブ遅延 ───╯╰─                12.4 s
-  stall                       2 回 / 1.8 s
-  切替                              3 回
-```
 
 ## HLS には getStats() が無い
 
@@ -41,6 +25,16 @@ Chrome デスクトップは `<video>` のネイティブHLS再生に対応し�
 3. 「パッケージ化されていない拡張機能を読み込む」→ このフォルダを選択
 
 ツールバーのアイコンをクリックすると小窓の表示 / 非表示が切り替わる。
+
+| 操作 | 動作 |
+|---|---|
+| ツールバーアイコン | 小窓の表示 / 非表示 |
+| ヘッダーをドラッグ | 位置を移動（タブ単位で保存される） |
+| `⧉` ボタン | 小窓を別ウィンドウ（Document Picture-in-Picture）に出す。もう一度押すか窓を閉じると戻る |
+| `⤓` ボタン | CSV / JSON エクスポート、履歴のクリア |
+| `⚙` ボタン | 設定画面を開く |
+| `–` ボタン | 折りたたみ |
+| `×` ボタン | 非表示（ツールバーアイコンで戻す） |
 
 読み込んだ時点で開いていたタブにはコンテンツスクリプトが入らないので、計測したいタブは一度リロードすること。
 
@@ -131,17 +125,20 @@ stall と HTTPエラーは累積値ではなく**増分**で判定する。累�
 | `visible` | タブが表示されていたか。`false` の区間で `fps` が 0 でも異常ではない |
 | `segment_duration_sec` | 余裕度の計算に**実際に使った**尺。セグメント個別の `#EXTINF` が取れればその値 |
 
-小窓が持つ履歴はページのメモリ上にあり、ページを離れると消える。既定の保持時間は30分。
+小窓から書き出せるのは、そのページで保持している直近30分（設定で変更可）。
 
-### ログの取り置き
+### 保存済みの履歴
 
-小窓が集めたログは、数秒ごとに Service Worker へ送られ `chrome.storage.session` にタブ単位で溜まる。**配信が止まったあとでも、タブを閉じたあとでも、設定画面の「ログ」から CSV / JSON を保存できる**。列は `⤓` からの書き出しとまったく同じ。
+履歴は10秒ごとに拡張のストレージ（`chrome.storage.local`）へ書き足される。**ページをリロードしたり離れたり、配信が止まってタブを閉じたりしても残る**ので、障害に気づいたときには再生し直していた、という場合でも後から追える。
+
+- 設定画面の「保存済みの履歴」に、ページ単位（リロードごとに別セッション）で一覧が出る。そこから CSV / JSON で書き出す・削除する。列は `⤓` からの書き出しとまったく同じ
+- 最後の記録から24時間（設定で変更可）経ったセッションは自動で消える
+- 目安は 1時間あたり約2MB（1プレーヤー、1秒間隔）。`unlimitedStorage` 権限で容量上限を外してある
+- 設定の「ページを離れても履歴を残す」を OFF にすれば書き出しは行わない
 
 小窓も、再生が止まった瞬間に消えたりはしない。履歴が残っているうちは開いたままで、その場で書き出せる。
 
-保持は**ブラウザを閉じるまで**。`storage.session` はメモリ上の領域で、ディスクには書かれない。古いログが溜まり続けてゴミにならないよう、意図的にここで区切ってある。上限は 1タブ 6000 行 / 8タブぶんで、超えると古い側から捨てる。
-
-小窓の位置も同じく `storage.session` にタブ単位で持つ。複数のタブで計測しているとき、片方を動かしても他のタブの小窓は動かない。
+小窓の位置は `chrome.storage.session` にタブ単位で持つ。複数のタブで計測しているとき、片方を動かしても他のタブの小窓は動かない。
 
 ## 構成
 
@@ -153,14 +150,16 @@ src/content/bridge.js        ISOLATED / 全フレーム / document_start
                              上り: メトリクスを Service Worker へ中継
                              下り: 更新間隔を MAIN world へ postMessage
 src/bg/sw.js                 Service Worker
-                             フレーム間の中継、ログの蓄積（storage.session）、
-                             小窓の位置のタブ単位の記憶
-src/content/overlay.js       HUD 描画・履歴保持・スパークライン・エクスポート
+                             フレーム間の中継、小窓の位置のタブ単位の記憶（storage.session）
+src/content/overlay.js       HUD 描画・履歴保持と永続化・スパークライン・エクスポート
 src/content/overlay-style.js Shadow DOM に注入する HUD のスタイル
 src/common/config.js         設定の既定値とマージ処理
-src/common/export.js         CSV / JSON の列定義と組み立て（オーバーレイと設定画面が共有）
-src/options/                 設定画面
+src/common/export.js         CSV / JSON の列定義と組み立て、履歴の永続化（オーバーレイと設定画面が共有）
+src/options/                 設定画面・保存済み履歴の一覧
 test/                        検証用ページ（後述）
+scripts/package.sh           ストア提出用 zip を dist/ に作る
+store/                       ストア掲載文（LISTING.md）と画像素材
+PRIVACY.md                   プライバシーポリシー（ストアから参照）
 ```
 
 アーキテクチャ（MAIN world 注入 → bridge → Service Worker → 小窓、フルスクリーン時の再配置、設定の伝搬）は WebRTC Analyzer と共通。設計の経緯はそちらの README と履歴を参照。
@@ -199,7 +198,7 @@ python3 test/serve.py
 | http://localhost:8732/test/standalone.html | 拡張なしで収集と描画だけを検証（`test/shim.js` が chrome.* を代替） |
 | http://localhost:8732/test/options-preview.html | 拡張なしで設定画面を検証 |
 
-バリアントのボタンで切替を起こせる。`window.__hls` から hls.js のインスタンスを直接触れる。
+バリアントのボタンで切替を起こせる。「video を直接全画面」ボタンは、`<video>` 要素そのものを全画面にするプレーヤーの再現用（`⧉` の確認に使う）。`window.__hls` から hls.js のインスタンスを直接触れる。
 
 ```js
 __hls.currentLevel = 0
@@ -227,8 +226,7 @@ document.querySelector('[data-hla]').shadowRoot.querySelector('.hud')
 
 - **URL の拡張子で判別している**。`.m3u8` / `.ts` / `.m4s` / `.mp4` などを見ているため、拡張子を持たない署名付きURLや、クエリでセグメントを出し分けるCDNでは取りこぼす（[#1](https://github.com/a211chan/HLS-analyzer/issues/1)）
 - **1フレームに複数のHLS再生があると、いちばん大きい `<video>` を代表として表示する**。ネットワーク側の集計はフレーム単位なので、複数ストリームが混ざる
-- **ログはブラウザを閉じると消える**。`chrome.storage.session` に置いており、ディスクには残さない（意図的な設計）
-- **`<video>` 要素そのものがフルスクリーンの場合は重ねられない**。video は子要素を描画しないため
+- **`<video>` 要素そのものがフルスクリーンの場合、ページ内の小窓は消える**。video は子要素を描画しないため。全画面にする前に `⧉` で別ウィンドウに出しておけば見える（`requestWindow()` はユーザー操作起点でしか呼べないので、全画面後には開けない）
 - **Safari のネイティブHLS再生には使えない**。取得がブラウザ内部で行われ JS から見えない。Chrome デスクトップでは該当しない
 - **LL-HLS の部分セグメント（`#EXT-X-PART`）は未対応**。余裕度の分母がセグメント尺のままになり、ライブ遅延の精度も出ない（[#2](https://github.com/a211chan/HLS-analyzer/issues/2)）
 - **`Timing-Allow-Origin` を返さない配信ではキャッシュを判定できない**。`from_cache` が空欄で埋まる。同一URLの再取得は除外できるので実用上は補えるが、初回取得がキャッシュから返る場合（別タブが先に取得済み等）は取りこぼす
@@ -240,10 +238,19 @@ document.querySelector('[data-hla]').shadowRoot.querySelector('.hud')
 
 - **セグメント／プレイリストのURLは外に出さない**。署名付きトークンを含みうるため、URL は収集層のメモリ内に留め、小窓にもエクスポートにも載せない
 - **メディアの中身は保持しない**。セグメントはバイト数を数えながら読み捨てる
-- `chrome.storage.local`（ディスク）に保存するのは設定だけ。小窓の位置と計測ログは `chrome.storage.session`（メモリ）に置き、ブラウザを閉じると消える
+- `chrome.storage.local` に保存するのは設定と計測履歴。履歴に載るのはホスト名と上記の数値だけで、セグメントの URL やページのパス・クエリは残さない。拡張の外には出ず、期限（既定24時間）が来れば自動で消える。設定画面から即時に全削除もできる
+- 小窓の位置は `chrome.storage.session`（メモリ）にタブ単位で置き、ブラウザを閉じると消える
 - エクスポートは `chrome.downloads` 経由で行う。ページ側から書き出し内容は読めない
 
 なお、HLS の利用有無を事前に判別できないため、コンテンツスクリプトは全ページ・全フレームに注入される。`.m3u8` を一度も踏んでいないページではポーリングを行わない。
+
+## Chrome ウェブストアへの提出
+
+```bash
+./scripts/package.sh
+```
+
+`dist/hls-analyzer-<version>.zip` ができる。掲載文・権限の正当化・画像素材は [`store/LISTING.md`](store/LISTING.md)、プライバシーポリシーは [`PRIVACY.md`](PRIVACY.md)。zip に入るのは `manifest.json` / `LICENSE` / `icons/` / `src/` だけで、`test/`（hls.js 同梱）は含まない。
 
 ## ライセンス
 

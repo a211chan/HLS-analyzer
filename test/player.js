@@ -57,4 +57,7 @@
 
   video.addEventListener('waiting', () => log('stall（waiting）'));
   video.addEventListener('playing', () => log('再生中'));
+
+  // コンテナではなく <video> 要素そのものを全画面にする素朴なプレーヤーを模す
+  document.getElementById('fsVideo')?.addEventListener('click', () => video.requestFullscreen());
 })();
