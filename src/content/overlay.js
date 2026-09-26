@@ -19,6 +19,8 @@
   /** これだけ更新が途絶えたストリームは表示から落とす */
   const STALE_MS = 6000;
   const RENDER_MS = 500;
+  /** 受信が途切れている間の描画間隔。値は動かないので落としてよい */
+  const IDLE_MS = 5000;
   /*
    * Map の要素数の上限。キーは frameId なので実運用では数件にしかならないが、
    * ページ側は iframe を大量に作れば別の frameId を無限に増やせる。頭打ちにする。
@@ -39,6 +41,10 @@
   let hostEl = null;
   let menuEl = null;
   let ticking = null;
+  let tickMs = 0;
+  /** Document Picture-in-Picture で開いた別ウィンドウ。null なら通常のページ内表示 */
+  let pipWin = null;
+  const CAN_PIP = IS_TOP && 'documentPictureInPicture' in window;
 
   // ------------------------------------------------------------- 受信
 
@@ -59,7 +65,7 @@
     store.set(frameId, { net: msg.net, player, host, at: now });
     record(frameId, host, msg.net, player, now);
 
-    if (!ticking) ticking = setInterval(render, RENDER_MS);
+    tick(RENDER_MS);
   });
 
   /** key が未登録で満杯なら、いちばん古い項目を捨てて枠を空ける（Map は挿入順） */
@@ -84,7 +90,9 @@
     let h = history.get(frameId);
     if (!h) {
       cap(history, MAX_FRAMES, frameId);
-      h = { meta: { host }, samples: [] };
+      // frame は「どのプレーヤーの行か」を復元する唯一の手がかり。1ページに複数の
+      // プレーヤーが iframe で並ぶ構成では、これが無いと書き出しを読み解けない。
+      h = { meta: { host, frame: frameId }, samples: [] };
       history.set(frameId, h);
     }
     h.samples.push({
@@ -98,7 +106,13 @@
       stalls: player?.stalls ?? null,
       stallSec: player?.stallSec ?? null,
       stallDelta: player?.stallDelta ?? null,
+      freezes: player?.freezes ?? null,
+      freezeSec: player?.freezeSec ?? null,
+      freezeDelta: player?.freezeDelta ?? null,
+      visible: player?.visible ?? null,
       droppedPct: player?.droppedPct ?? null,
+      cached: net.cached ?? null,
+      repeat: net.repeat ?? null,
       live: net.live,
       variantIndex: net.variantIndex,
       variantCount: net.variantCount,
@@ -107,6 +121,7 @@
       codecs: net.codecs,
       switches: net.switches,
       downloadBps: net.downloadBps,
+      segKind: net.segKind,
       segBytes: net.segBytes,
       segMs: net.segMs,
       segDur: net.segDur,
@@ -118,7 +133,47 @@
 
     const cutoff = now - cfg.historyMinutes * 60000;
     while (h.samples.length && h.samples[0].t < cutoff) h.samples.shift();
+
+    // 永続化はトップフレームだけが行う。子フレームぶんも Service Worker が
+    // トップへ転送しているので、全フレームで書くと同じ行が二重に溜まる。
+    if (IS_TOP && cfg.persist) {
+      const key = String(frameId);
+      persist.metas[key] = h.meta;
+      persist.rows.push([key, h.samples[h.samples.length - 1]]);
+      if (!persist.timer) persist.timer = setTimeout(flush, PERSIST_MS);
+    }
   }
+
+  // ------------------------------------------------------------- 永続化
+
+  /*
+   * 履歴はメモリ上にもあるが、ページを離れると消える。障害に気づいた時点で
+   * 再生し直していても事後に追えるよう、トップフレームだけが一定間隔で
+   * chrome.storage.local へ差分を書き足す（子フレームのぶんもトップに集約済み）。
+   * 1ページ = 1セッション。一覧とエクスポートは設定画面から行う。
+   */
+  const PERSIST_MS = 10000;
+  const persist = { session: null, metas: {}, rows: [], timer: null };
+
+  function flush() {
+    clearTimeout(persist.timer);
+    persist.timer = null;
+    if (!persist.rows.length) return;
+    if (!persist.session) {
+      persist.session = { id: HLA_EXPORT.newSessionId(), host: location.host || 'page', start: Date.now(), end: 0, rows: 0, chunks: 0 };
+      // 新しいセッションを始めるついでに、保持期限を過ぎたものを掃除する
+      HLA_EXPORT.prune(cfg.persistHours).catch(() => {});
+    }
+    const { metas, rows } = persist;
+    persist.metas = {};
+    persist.rows = [];
+    HLA_EXPORT.writeChunk(persist.session, metas, rows).catch(() => {
+      // 拡張の再読み込み直後など。取りこぼしは許容する（メモリ上の履歴は残っている）
+    });
+  }
+
+  // 離脱時に残りを書く。完了を待てないので最善努力
+  addEventListener('pagehide', flush);
 
   // ------------------------------------------------------------- 設定
 
@@ -128,16 +183,27 @@
     render();
   });
 
-  chrome.storage.local.get(['collapsed', 'pos']).then((v) => {
+  chrome.storage.local.get('collapsed').then((v) => {
     collapsed = v.collapsed === true;
-    pos = v.pos || null;
     if (hud) applyState();
   });
+
+  /*
+   * 小窓の位置は storage.local に置かない。local は全タブ共通なので、片方のタブで
+   * 動かすと storage.onChanged が他のタブにも飛び、開いている小窓がいっせいに
+   * 同じ場所へ移動してしまう。位置は Service Worker がタブ単位で覚える。
+   */
+  chrome.runtime
+    .sendMessage({ __hlaChannel: CHANNEL, type: 'ui-get' })
+    .then((v) => {
+      pos = v?.pos || null;
+      if (hud) applyState();
+    })
+    .catch(() => {});
 
   chrome.storage.onChanged.addListener(async (changes, area) => {
     if (area !== 'local') return;
     if (changes.collapsed) collapsed = changes.collapsed.newValue === true;
-    if (changes.pos) pos = changes.pos.newValue || null;
     if (HLA_CONFIG.KEYS.some((k) => k in changes)) cfg = await HLA_CONFIG.load();
     if (hud) applyState();
     render();
@@ -153,15 +219,20 @@
 
   function shouldShow() {
     if (!cfg.enabled) return false;
+    // 別ウィンドウに出しているあいだはページの全画面状態に左右されない
+    if (pipWin) return live().length > 0 || history.size > 0;
 
     const fs = fullscreenEl();
     // <video> や <iframe> は子要素を描画しないので、その上には重ねられない。
     // iframe が全画面なら、その iframe 自身のオーバーレイが担当する。
+    // <video> の場合はどのフレームからも重ねられないので、⧉ で別ウィンドウに出してもらう。
     if (fs && (fs.tagName === 'VIDEO' || fs.tagName === 'IFRAME')) return false;
     // 子フレームは全画面のときだけ出る（通常時はトップの小窓と二重になる）
     if (!IS_TOP && !fs) return false;
 
-    return live().length > 0;
+    // 配信が止まっても、履歴が残っているうちは閉じない。止まった瞬間に消えると
+    // 肝心の「落ちたときのログ」を保存できないまま小窓が無くなってしまう。
+    return live().length > 0 || history.size > 0;
   }
 
   function live() {
@@ -191,6 +262,7 @@
       <header>
         <span class="title">HLS Analyzer</span>
         <span class="alarm" hidden></span>
+        ${CAN_PIP ? '<button data-act="pip" title="別ウィンドウに出す（動画を直接全画面にするプレーヤーでも見える）">⧉</button>' : ''}
         <button data-act="export"   title="エクスポート">⤓</button>
         <button data-act="options"  title="設定">⚙</button>
         <button data-act="collapse" title="折りたたみ">–</button>
@@ -225,11 +297,12 @@
     else if (act === 'close') chrome.storage.local.set({ enabled: false });
     else if (act === 'options') chrome.runtime.sendMessage({ __hlaChannel: CHANNEL, type: 'open-options' });
     else if (act === 'export') menuEl.hidden = !menuEl.hidden;
+    else if (act === 'pip') togglePip();
     else if (act === 'csv') exportFile('csv');
     else if (act === 'json') exportFile('json');
     else if (act === 'clear') {
       history.clear();
-      note('履歴をクリアしました');
+      note('履歴をクリアしました（保存済みの履歴は設定画面から消せます）');
     }
   }
 
@@ -240,11 +313,46 @@
     note.t = setTimeout(() => (el.textContent = ''), 4000);
   }
 
+  /*
+   * Document Picture-in-Picture。<video> 要素そのものが全画面になると、
+   * video は子要素を描画しないためページ内のどこにも小窓を重ねられない。
+   * 常に最前面に出る別ウィンドウへ小窓ごと移しておけば、全画面の上にも見える。
+   * requestWindow() はユーザー操作起点でしか呼べないので、ボタンで開く。
+   */
+  async function togglePip() {
+    if (pipWin) {
+      pipWin.close();
+      return;
+    }
+    try {
+      const w = await documentPictureInPicture.requestWindow({ width: 320, height: 460 });
+      w.document.title = 'HLS Analyzer';
+      w.document.body.style.cssText = 'margin:0;background:#121418;';
+      // 閉じられたらページ内の表示に戻す
+      w.addEventListener('pagehide', () => {
+        pipWin = null;
+        hud.classList.remove('pip');
+        applyState();
+        render();
+      });
+      pipWin = w;
+      hud.classList.add('pip');
+      menuEl.hidden = true;
+      applyState();
+      render();
+    } catch (_) {
+      note('別ウィンドウを開けませんでした');
+    }
+  }
+
   function applyState() {
     hud.classList.toggle('collapsed', collapsed);
     hud.classList.toggle('spark', !!cfg.sparkline);
     if (collapsed) menuEl.hidden = true;
-    if (pos) {
+    if (pipWin) {
+      // 別ウィンドウ内ではウィンドウ自体を動かすので、位置指定は使わない
+      hud.style.left = hud.style.top = hud.style.right = '';
+    } else if (pos) {
       hud.style.left = clamp(pos.left, 0, Math.max(0, innerWidth - 120)) + 'px';
       hud.style.top = clamp(pos.top, 0, Math.max(0, innerHeight - 28)) + 'px';
       hud.style.right = 'auto';
@@ -264,7 +372,7 @@
     let dy = 0;
 
     handle.addEventListener('pointerdown', (e) => {
-      if (e.target.tagName === 'BUTTON') return;
+      if (e.target.tagName === 'BUTTON' || pipWin) return;
       const r = hud.getBoundingClientRect();
       dx = e.clientX - r.left;
       dy = e.clientY - r.top;
@@ -281,7 +389,7 @@
     function onUp(e) {
       handle.removeEventListener('pointermove', onMove);
       handle.releasePointerCapture(e.pointerId);
-      if (pos) chrome.storage.local.set({ pos });
+      if (pos) chrome.runtime.sendMessage({ __hlaChannel: CHANNEL, type: 'ui-set', pos }).catch(() => {});
     }
   }
 
@@ -292,17 +400,14 @@
 
     if (!show) {
       if (hostEl && hostEl.parentNode) hostEl.remove();
-      if (!store.size && ticking) {
-        clearInterval(ticking);
-        ticking = null;
-      }
+      if (!store.size) idle();
       return;
     }
 
     if (!hostEl) build();
 
     // フルスクリーン要素があればその配下へ移す（トップレイヤーに入れるため）
-    const parent = fullscreenEl() || document.documentElement;
+    const parent = pipWin ? pipWin.document.body : fullscreenEl() || document.documentElement;
     if (hostEl.parentNode !== parent) parent.appendChild(hostEl);
 
     const entries = live().sort((a, b) => a[1].host.localeCompare(b[1].host));
@@ -314,11 +419,43 @@
       return r.html;
     });
 
-    body.innerHTML = html.join('') || '<div class="empty">no active stream</div>';
+    body.innerHTML = html.join('') || stopped();
 
     const alarm = hud.querySelector('.alarm');
     alarm.hidden = !(cfg.alerts && alarms > 0);
     alarm.textContent = alarms > 0 ? `⚠ ${alarms}` : '';
+
+    // 受信が途切れたら描画を緩める。小窓自体は履歴を保存できるよう残したまま。
+    if (!store.size) idle();
+  }
+
+  function stopped() {
+    if (!history.size) return '<div class="empty">no active stream</div>';
+    return '<div class="empty">配信が停止しました。<br>⤓ から、または設定画面の「保存済みの履歴」から書き出せます。</div>';
+  }
+
+  function tick(ms) {
+    if (tickMs === ms) return;
+    if (ticking) clearInterval(ticking);
+    tickMs = ms;
+    ticking = ms ? setInterval(render, ms) : null;
+  }
+
+  /*
+   * 受信が止まったあとの後始末。履歴が保持期間を過ぎて空になったら、そこで
+   * ようやく小窓を閉じてタイマーも止める。保存する時間は十分に残る。
+   */
+  function idle() {
+    prune();
+    tick(history.size ? IDLE_MS : 0);
+  }
+
+  function prune() {
+    const cutoff = Date.now() - cfg.historyMinutes * 60000;
+    for (const [k, h] of history) {
+      while (h.samples.length && h.samples[0].t < cutoff) h.samples.shift();
+      if (!h.samples.length) history.delete(k);
+    }
   }
 
   function renderStream(frameId, entry) {
@@ -331,8 +468,9 @@
     const droppedLv = level('droppedPct', player?.droppedPct);
     const latencyLv = level('latencySec', player?.latencySec);
     const stallLv = level('stall', player?.stallDelta);
+    const freezeLv = level('freeze', player?.freezeDelta);
     const errorLv = level('errors', deltaOf(samples, 'errors'));
-    const crit = [bufferLv, headroomLv, droppedLv, latencyLv, stallLv, errorLv].filter((l) => l === 'crit').length;
+    const crit = [bufferLv, headroomLv, droppedLv, latencyLv, stallLv, freezeLv, errorLv].filter((l) => l === 'crit').length;
 
     const mode = net.live === true ? 'LIVE' : net.live === false ? 'VOD' : '';
     const variant =
@@ -349,11 +487,21 @@
       // HLS におけるジッターバッファ相当。痩せると stall する。
       { key: 'buffer', label: 'buffer', value: sec(player?.bufferSec), level: bufferLv, field: 'bufferSec' },
       // 1.0 を割るとダウンロードが再生に追いつかない。HLS の健全性はまずここ。
-      { key: 'headroom', label: '余裕度', value: ratio(net.headroom), level: headroomLv, field: 'headroom' },
+      {
+        key: 'headroom',
+        label: '余裕度',
+        // キャッシュから返ったセグメントは集計から外しているが、それでも直近に
+        // ヒットがあったなら「回線を測れていない」ことを見えるようにしておく
+        value: net.headroom != null ? ratio(net.headroom) + (net.cached || net.repeat ? ' (cache)' : '') : null,
+        level: headroomLv,
+        field: 'headroom',
+      },
       { key: 'download', label: 'DL速度', value: bps(net.downloadBps), field: 'downloadBps' },
       { key: 'segment', label: 'segment', value: segLabel(net), field: 'segMs' },
       { key: 'latency', label: 'ライブ遅延', value: sec(player?.latencySec), level: latencyLv, field: 'latencySec' },
       { key: 'stall', label: 'stall', value: stallLabel(player), level: stallLv, field: 'stalls' },
+      // バッファがあるのに絵が止まった回数。stall とは別の失敗の仕方。
+      { key: 'freeze', label: 'フリーズ', value: freezeLabel(player), level: freezeLv, field: 'freezes' },
       { key: 'dropped', label: 'ドロップ', value: pct(player?.droppedPct), level: droppedLv, field: 'droppedPct' },
       { key: 'switches', label: '切替', value: net.switches ? `${net.switches} 回` : null, field: 'switches' },
       { key: 'reload', label: 'PL再読込', value: net.live ? sec(net.plReloadSec) : null, field: 'plReloadSec' },
@@ -385,6 +533,12 @@
   function segLabel(net) {
     if (net.segBytes == null || net.segMs == null) return null;
     return `${bytes(net.segBytes)} / ${Math.round(net.segMs)} ms`;
+  }
+
+  function freezeLabel(player) {
+    if (!player || player.freezes == null) return null;
+    if (!player.freezes) return '0';
+    return `${player.freezes} 回 / ${player.freezeSec.toFixed(1)} s`;
   }
 
   function stallLabel(player) {
@@ -484,67 +638,18 @@
 
   // ------------------------------------------------------------- エクスポート
 
-  const COLS = [
-    ['time_local', (m, s) => localStamp(s.t)],
-    ['time_iso', (m, s) => new Date(s.t).toISOString()],
-    ['host', (m) => m.host],
-    ['mode', (m, s) => (s.live === true ? 'LIVE' : s.live === false ? 'VOD' : '')],
-    ['state', (m, s) => s.state],
-    ['width', (m, s) => s.w],
-    ['height', (m, s) => s.h],
-    ['fps', (m, s) => round(s.fps, 1)],
-    ['variant_index', (m, s) => (s.variantIndex != null ? s.variantIndex + 1 : null)],
-    ['variant_count', (m, s) => s.variantCount],
-    ['variant_bps', (m, s) => s.variantBps],
-    ['variant_resolution', (m, s) => s.variantRes],
-    ['codecs', (m, s) => s.codecs],
-    ['variant_switches', (m, s) => s.switches],
-    ['buffer_sec', (m, s) => round(s.bufferSec, 2)],
-    ['headroom', (m, s) => round(s.headroom, 2)],
-    ['download_bps', (m, s) => round(s.downloadBps, 0)],
-    ['segment_bytes', (m, s) => s.segBytes],
-    ['segment_download_ms', (m, s) => round(s.segMs, 0)],
-    ['segment_duration_sec', (m, s) => round(s.segDur, 3)],
-    ['target_duration_sec', (m, s) => s.targetDur],
-    ['live_latency_sec', (m, s) => round(s.latencySec, 2)],
-    ['stall_count', (m, s) => s.stalls],
-    ['stall_total_sec', (m, s) => round(s.stallSec, 2)],
-    ['dropped_pct', (m, s) => round(s.droppedPct, 3)],
-    ['playlist_reload_sec', (m, s) => round(s.plReloadSec, 2)],
-    ['http_errors', (m, s) => s.errors],
-  ];
-
-  function allRows() {
-    const rows = [];
-    for (const h of history.values()) for (const s of h.samples) rows.push({ meta: h.meta, s });
-    rows.sort((a, b) => a.s.t - b.s.t);
-    return rows;
-  }
-
   function exportFile(kind) {
-    const rows = allRows();
+    const rows = HLA_EXPORT.rows(history.values());
     if (!rows.length) {
       note('まだ履歴がありません');
       return;
     }
 
-    let text;
-    let mime;
-    if (kind === 'csv') {
-      const lines = [COLS.map((c) => c[0]).join(',')];
-      for (const { meta, s } of rows) lines.push(COLS.map((c) => csvCell(c[1](meta, s))).join(','));
-      // BOM(U+FEFF) + CRLF。Excel で開いたときに文字化けせず、行も崩れない。
-      text = '﻿' + lines.join('\r\n');
-      mime = 'text/csv;charset=utf-8';
-    } else {
-      const out = rows.map(({ meta, s }) => Object.fromEntries(COLS.map((c) => [c[0], c[1](meta, s) ?? null])));
-      text = JSON.stringify(out, null, 1);
-      mime = 'application/json';
-    }
+    const { text, mime } = HLA_EXPORT.build(rows, kind);
 
     /*
      * ページの DOM に <a href="blob:..."> を挿してクリックする方法は使わない。
-     * blob URL はページの origin で発行されるので、ページ側が MutationObserver で
+     * blob URLはページの origin で発行されるので、ページ側が MutationObserver で
      * href を拾えば、収集した履歴をそのまま読み取れてしまう。計測対象のサイト自身に
      * 品質ログを渡すことになる。Service Worker の chrome.downloads に投げれば、
      * ページ側からは保存の事実すら見えない。
@@ -553,53 +658,14 @@
       .sendMessage({
         __hlaChannel: CHANNEL,
         type: 'download',
-        url: dataUrl(text, mime),
-        filename: `hls-${fileStamp()}.${kind}`,
+        url: HLA_EXPORT.dataUrl(text, mime),
+        filename: `hls-${HLA_EXPORT.fileStamp()}.${kind}`,
       })
       .then((res) => {
         if (res && res.ok) note(`${rows.length} 行を書き出しました`);
         else note(`保存できませんでした: ${res?.error ?? '不明なエラー'}`);
       })
       .catch(() => note('保存できませんでした。拡張を再読み込みしてください'));
-  }
-
-  /** UTF-8 の文字列を data: URL にする。chrome.downloads は data: を受け付ける */
-  function dataUrl(text, mime) {
-    const bytes = new TextEncoder().encode(text);
-    let bin = '';
-    // 一度に渡すと引数が多すぎて RangeError になるので分割して詰める
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    }
-    return `data:${mime};base64,${btoa(bin)}`;
-  }
-
-  function csvCell(v) {
-    if (v == null) return '';
-    const s = String(v);
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  }
-
-  function round(v, digits) {
-    return typeof v === 'number' && Number.isFinite(v) ? +v.toFixed(digits) : null;
-  }
-
-  function pad(n, w = 2) {
-    return String(n).padStart(w, '0');
-  }
-
-  /** Excel がそのまま日時として解釈できる形式 */
-  function localStamp(t) {
-    const d = new Date(t);
-    return (
-      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
-      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
-    );
-  }
-
-  function fileStamp() {
-    const d = new Date();
-    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   }
 
   // ------------------------------------------------------------- 整形

@@ -20,6 +20,10 @@
     sparkSeconds: 60,
     /** エクスポート用に履歴を保持する分数 */
     historyMinutes: 30,
+    /** 履歴を chrome.storage.local に書き出し、ページを離れても残すか */
+    persist: true,
+    /** 書き出した履歴を残す時間。最後の書き込みからこれだけ経つと消す */
+    persistHours: 24,
     /** しきい値による色分けを行うか */
     alerts: true,
 
@@ -35,6 +39,7 @@
       segment: true,
       latency: true,
       stall: true,
+      freeze: true,
       dropped: true,
       switches: true,
       errors: true,
@@ -58,6 +63,8 @@
       latencySec: { dir: 'above', warn: 30, crit: 60 },
       /** 直近1サンプルでの stall 増分(回) */
       stall: { dir: 'above', warn: 1, crit: 2 },
+      /** 直近1サンプルでのフリーズ増分(回)。バッファがあるのに絵が止まった回数 */
+      freeze: { dir: 'above', warn: 1, crit: 2 },
       /** 直近1サンプルでの HTTP エラー増分(件) */
       errors: { dir: 'above', warn: 1, crit: 1 },
     },
