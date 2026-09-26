@@ -34,7 +34,7 @@
 
   // ---------------------------------------------------------------- 収集状態
 
-  /** 直近のセグメント取得。{t, url, bytes, ms, status, dur, cached, repeat} */
+  /** 直近のセグメント取得。{t, url, kind, bytes, ms, status, dur, cached, repeat} */
   const segments = [];
   /*
    * 一度取得したセグメントURL。VOD を巡回監視する構成では同じURLを何度も踏み、
@@ -47,8 +47,19 @@
   const playlistFetches = [];
   /** マスタープレイリストのバリアント一覧（ビットレート昇順） */
   let variants = [];
-  /** メディアプレイリスト url -> {targetDuration, isLive, segUrls, segDuration, lastAt} */
+  /** メディアプレイリスト url -> {targetDuration, isLive, entries, segDuration, lastAt} */
   const mediaPlaylists = new Map();
+  /*
+   * プレイリストに載っている全URLの索引。拡張子に頼らずセグメントを判別するための
+   * 主たる手がかり。 key -> {kind, dur, plUrl}
+   *   key は絶対URL。#EXT-X-BYTERANGE で1ファイルを分割している場合は
+   *   "URL|開始-終了" にして、同じURLの別範囲を区別する。
+   * byPath はクエリを落としたURLでの副索引。プレーヤーや CDN が後からトークンを
+   * 付け足しても引けるようにする。
+   */
+  let segIndex = new Map();
+  let byPath = new Map();
+  const MAX_INDEX = 2000;
   /** 現在再生中のバリアント index。判別できなければ null */
   let currentVariant = null;
   let variantSwitches = 0;
@@ -59,8 +70,19 @@
   // ------------------------------------------------------------ URL の分類
 
   const SEGMENT_EXT = /\.(ts|m4s|mp4|m4v|m4a|aac|mp3|cmfv|cmfa|cmft)$/;
+  const PLAYLIST_TYPE = /^(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/(x-)?mpegurl)\b/i;
+  const SEGMENT_TYPE = /^(video\/(mp2t|mp4|iso\.segment)|audio\/(mp4|aac|mpeg))\b/i;
 
-  function classify(rawUrl) {
+  /**
+   * 取得を始める前の判別。返り値は 'playlist' / 'segment' / 'init' / null。
+   *   1. プレイリストに載っているURLか（拡張子に依存しない）
+   *   2. URL の拡張子
+   * どちらでも決まらなければ null を返し、レスポンスヘッダ到着時に
+   * classifyByType() でもう一度だけ判定する。
+   */
+  function classify(rawUrl, range) {
+    const e = lookup(rawUrl, range);
+    if (e) return e.kind;
     try {
       const path = new URL(rawUrl, location.href).pathname.toLowerCase();
       if (path.endsWith('.m3u8')) return 'playlist';
@@ -68,6 +90,51 @@
     } catch (_) {
       /* 壊れたURLは無視 */
     }
+    return null;
+  }
+
+  /**
+   * Content-Type による判別。application/octet-stream を返す CDN は多いので、
+   * それだけではセグメントとみなさない（索引での照合に任せる）。
+   */
+  function classifyByType(type) {
+    if (!type) return null;
+    if (PLAYLIST_TYPE.test(type)) return 'playlist';
+    if (SEGMENT_TYPE.test(type)) return 'segment';
+    return null;
+  }
+
+  /** 索引を引く。範囲付き → URL 完全一致 → クエリを落としたURL の順 */
+  function lookup(rawUrl, range) {
+    if (!segIndex.size) return null;
+    const abs = absolute(rawUrl);
+    if (range) {
+      const hit = segIndex.get(abs + '|' + range);
+      if (hit) return hit;
+    }
+    return segIndex.get(abs) || byPath.get(stripQuery(abs)) || null;
+  }
+
+  function stripQuery(url) {
+    const i = url.search(/[?#]/);
+    return i < 0 ? url : url.slice(0, i);
+  }
+
+  /** "bytes=100-199" → "100-199"。開始のみ（"100-"）は照合できないので捨てる */
+  function parseRange(v) {
+    const m = /^bytes=(\d+)-(\d+)$/.exec(String(v || '').trim());
+    return m ? `${m[1]}-${m[2]}` : null;
+  }
+
+  /** fetch の引数から Range ヘッダを取り出す */
+  function rangeOf(input, init) {
+    try {
+      const h = init?.headers ?? (input instanceof Request ? input.headers : null);
+      if (!h) return null;
+      if (h instanceof Headers) return parseRange(h.get('range'));
+      if (Array.isArray(h)) return parseRange(h.find(([k]) => /^range$/i.test(k))?.[1]);
+      for (const k of Object.keys(h)) if (/^range$/i.test(k)) return parseRange(h[k]);
+    } catch (_) {}
     return null;
   }
 
@@ -81,30 +148,37 @@
 
   // ------------------------------------------------------- 記録（共通の入口）
 
-  function recordSegment(url, bytes, ms, status, t0) {
+  function recordSegment(url, bytes, ms, status, t0, range, kind) {
     if (status >= 400 || status === 0) httpErrors++;
     const abs = absolute(url);
+    const entry = lookup(abs, range);
     /*
      * cached は undefined（未判定）で積む。Resource Timing のエントリは本文を
      * 読み終えた直後にはまだ登録されていないことがあり、この場で引くと取り逃す。
      * 集計時に解決し、それでも分からなければ諦めて null（不明）にする。
      */
-    const repeat = seenSegments.has(abs);
-    seenSegments.add(abs);
+    // バイトレンジ配信では同じURLの別範囲を順に取るので、範囲込みで「2回目か」を見る。
+    // URLだけで見ると2本目以降が全部「再取得」扱いになり、計測から外れてしまう。
+    const seenKey = range ? abs + '|' + range : abs;
+    const repeat = seenSegments.has(seenKey);
+    seenSegments.add(seenKey);
     if (seenSegments.size > 500) seenSegments.delete(seenSegments.values().next().value);
-    segments.push({ t: Date.now(), url: abs, bytes, ms, status, t0, dur: segDurationOf(abs), cached: undefined, repeat });
+    segments.push({
+      t: Date.now(),
+      url: abs,
+      // init（#EXT-X-MAP）は尺を持たない。計測に混ぜると余裕度が桁で狂う
+      kind: entry?.kind ?? (kind === 'init' ? 'init' : 'segment'),
+      bytes,
+      ms,
+      status,
+      t0,
+      dur: entry?.dur ?? null,
+      cached: undefined,
+      repeat,
+    });
     if (segments.length > 60) segments.shift();
-    detectVariant(abs);
+    detectVariant(entry);
     start();
-  }
-
-  /** そのセグメント自身の #EXTINF。どのプレイリストに載っていたかを横断で探す */
-  function segDurationOf(segUrl) {
-    for (const pl of mediaPlaylists.values()) {
-      const d = pl.segUrls.get(segUrl);
-      if (d != null) return d;
-    }
-    return null;
   }
 
   /*
@@ -197,17 +271,28 @@
   function parseMedia(url, text) {
     const lines = text.split(/\r?\n/);
     /*
-     * URL → そのセグメント自身の尺。以前は Set で「載っているか」しか持たず、
-     * 余裕度の計算にはプレイリスト末尾の #EXTINF を流用していた。尺が不揃いな
-     * 配信では、測ったセグメントと尺の出どころが別物になり数字が破綻する。
-     * #EXTINF は直後の URI 行に係るので、その対応をそのまま記録する。
+     * key → {kind, dur}。#EXTINF は直後の URI 行に係るので、その対応をそのまま
+     * 記録する（尺が不揃いな配信でも、測ったセグメントと尺の出どころを一致させる）。
+     * #EXT-X-MAP は init として登録する。拡張子（.mp4）だけで判別すると尺の無い
+     * セグメントとして扱われ、余裕度がプレイリストの代表尺で割られて狂う。
      */
-    const segUrls = new Map();
+    const entries = new Map();
     let targetDuration = null;
     /** 直前の #EXTINF。URI 行に係ったら消費する */
     let pending = null;
+    /** 直前の #EXT-X-BYTERANGE。"長さ@開始" の開始は省略されうる */
+    let pendingRange = null;
+    /** 開始が省略されたときに使う、URLごとの直前の終端 */
+    const nextOffset = new Map();
     /** 消費した最後の尺。プレイリスト単位の代表値・フォールバックとして残す */
     let lastDur = null;
+
+    const keyOf = (abs, len, off) => {
+      if (len == null) return abs;
+      const start = off ?? nextOffset.get(abs) ?? 0;
+      nextOffset.set(abs, start + len);
+      return `${abs}|${start}-${start + len - 1}`;
+    };
 
     for (const raw of lines) {
       const l = raw.trim();
@@ -215,13 +300,26 @@
         targetDuration = num(l.split(':')[1]);
       } else if (l.startsWith('#EXTINF')) {
         pending = num(l.slice(l.indexOf(':') + 1).split(',')[0]);
+      } else if (l.startsWith('#EXT-X-BYTERANGE')) {
+        pendingRange = byteRange(l.slice(l.indexOf(':') + 1));
+      } else if (l.startsWith('#EXT-X-MAP')) {
+        const attrs = parseAttrs(l.slice(l.indexOf(':') + 1));
+        if (attrs.URI) {
+          try {
+            const abs = new URL(attrs.URI, url).href;
+            const br = attrs.BYTERANGE ? byteRange(attrs.BYTERANGE) : null;
+            entries.set(keyOf(abs, br?.len, br?.off ?? 0), { kind: 'init', dur: null });
+          } catch (_) {}
+        }
       } else if (l && !l.startsWith('#')) {
         try {
-          segUrls.set(new URL(l, url).href, pending);
+          const abs = new URL(l, url).href;
+          entries.set(keyOf(abs, pendingRange?.len, pendingRange?.off), { kind: 'segment', dur: pending });
         } catch (_) {}
         if (pending != null) lastDur = pending;
         // #EXTINF を伴わない URI 行が続いても直前の尺を使い回さない
         pending = null;
+        pendingRange = null;
       }
     }
 
@@ -229,27 +327,54 @@
       targetDuration,
       // #EXT-X-ENDLIST があれば VOD、無ければ LIVE
       isLive: !text.includes('#EXT-X-ENDLIST'),
-      segUrls,
+      entries,
       segDuration: lastDur,
       lastAt: Date.now(),
     });
     if (lastDur != null) lastSegDuration = lastDur;
+    rebuildIndex();
+  }
+
+  /** "長さ@開始" / "長さ" */
+  function byteRange(v) {
+    const [len, off] = String(v).split('@').map(num);
+    return len != null ? { len, off: off ?? null } : null;
+  }
+
+  /*
+   * 索引の作り直し。LIVE ではプレイリストを読み直すたびに古いURLが流れていくので、
+   * 差分を管理するより「いま持っているプレイリストの中身」から毎回作るほうが単純で
+   * 古いURLも自然に消える。プレイリストは高々バリアント数ぶんなので軽い。
+   * 新しく読んだプレイリストから詰め、上限で打ち切る。
+   */
+  function rebuildIndex() {
+    const idx = new Map();
+    const paths = new Map();
+    const pls = [...mediaPlaylists.entries()].sort((a, b) => b[1].lastAt - a[1].lastAt);
+    outer: for (const [plUrl, pl] of pls) {
+      for (const [key, e] of pl.entries) {
+        if (idx.size >= MAX_INDEX) break outer;
+        const hit = { kind: e.kind, dur: e.dur, plUrl };
+        idx.set(key, hit);
+        const bare = key.split('|')[0];
+        // クエリ違いの副索引は範囲の無いURLだけ。範囲付きは範囲で引き分ける必要がある
+        if (bare === key) paths.set(stripQuery(bare), hit);
+      }
+    }
+    segIndex = idx;
+    byPath = paths;
   }
 
   /**
-   * いま取得したセグメントがどのバリアントのものかを、メディアプレイリストの
-   * セグメント一覧との照合で特定する。プレーヤーのAPIに一切依存しない。
+   * いま取得したセグメントがどのバリアントのものかを、プレイリスト索引の照合で
+   * 特定する。プレーヤーのAPIに一切依存しない。
    */
-  function detectVariant(segUrl) {
-    if (!variants.length) return;
-    for (const [plUrl, pl] of mediaPlaylists) {
-      if (!pl.segUrls.has(segUrl)) continue;
-      const idx = variants.findIndex((v) => v.plUrl === plUrl);
-      if (idx < 0) return;
-      if (currentVariant != null && currentVariant !== idx) variantSwitches++;
-      currentVariant = idx;
-      return;
-    }
+  function detectVariant(entry) {
+    if (!variants.length || !entry || entry.kind === 'init') return;
+    const idx = variants.findIndex((v) => v.plUrl === entry.plUrl);
+    if (idx < 0) return;
+    if (currentVariant != null && currentVariant !== idx) variantSwitches++;
+    currentVariant = idx;
   }
 
   function parseAttrs(s) {
@@ -270,28 +395,44 @@
 
   const nativeFetch = window.fetch;
   if (typeof nativeFetch === 'function') {
-    window.fetch = function (input) {
+    window.fetch = function (input, init) {
       const url = typeof input === 'string' ? input : input?.url ?? String(input);
-      const kind = classify(url);
-      if (!kind) return nativeFetch.apply(this, arguments);
-
+      const range = rangeOf(input, init);
+      const kind = classify(url, range);
       const t0 = performance.now();
+
+      if (!kind) {
+        /*
+         * URL では決まらなかった。拡張子の無い署名付きURLなどがここに来る。
+         * 本文は読まず、ヘッダが届いた時点の Content-Type だけで判定し、
+         * 当たったものだけ計測する。HLS と無関係な取得のコストはヘッダを1回見るだけ。
+         */
+        return nativeFetch.apply(this, arguments).then((res) => {
+          try {
+            const k = classifyByType(res.headers.get('content-type'));
+            if (k) measureBody(res.clone(), k, url, t0, res.status, range);
+          } catch (_) {}
+          return res;
+        });
+      }
+
       return nativeFetch.apply(this, arguments).then(
         (res) => {
           // fetch の Promise はヘッダ到着で解決する。本文を読み切った時刻まで
           // 測らないと「ダウンロード時間」にならないので、clone を消化して計る。
-          measureBody(res.clone(), kind, url, t0, res.status);
+          measureBody(res.clone(), kind, url, t0, res.status, range);
           return res;
         },
         (err) => {
-          recordSegment(url, 0, performance.now() - t0, 0, t0);
+          if (kind !== 'playlist') recordSegment(url, 0, performance.now() - t0, 0, t0, range, kind);
+          else recordPlaylist(url, performance.now() - t0, 0, '');
           throw err;
         }
       );
     };
   }
 
-  async function measureBody(res, kind, url, t0, status) {
+  async function measureBody(res, kind, url, t0, status, range) {
     try {
       if (kind === 'playlist') {
         const text = await res.text();
@@ -311,7 +452,7 @@
       } else {
         bytes = (await res.arrayBuffer()).byteLength;
       }
-      recordSegment(url, bytes, performance.now() - t0, status, t0);
+      recordSegment(url, bytes, performance.now() - t0, status, t0, range, kind);
     } catch (_) {
       /* 測定に失敗してもページの再生には影響させない */
     }
@@ -322,33 +463,60 @@
   // hls.js は既定で XHR を使う。fetch だけでは取りこぼす。
   const xhrOpen = XMLHttpRequest.prototype.open;
   const xhrSend = XMLHttpRequest.prototype.send;
+  const xhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   XMLHttpRequest.prototype.open = function (method, url) {
     this.__hlaUrl = url;
+    this.__hlaRange = null;
     return xhrOpen.apply(this, arguments);
+  };
+
+  // バイトレンジ配信の判別に Range が要る
+  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    if (/^range$/i.test(name)) this.__hlaRange = parseRange(value);
+    return xhrSetHeader.apply(this, arguments);
   };
 
   XMLHttpRequest.prototype.send = function () {
     const url = this.__hlaUrl;
-    const kind = url ? classify(url) : null;
-    if (kind) {
+    if (url) {
+      const range = this.__hlaRange;
+      const kind = classify(url, range);
       const t0 = performance.now();
-      // loadend は本文を受け切ってから発火するので、そのままDL時間になる
-      this.addEventListener('loadend', (e) => {
-        const ms = performance.now() - t0;
-        if (kind === 'playlist') {
-          let text = '';
+      if (kind) {
+        watchXhr(this, kind, url, range, t0);
+      } else {
+        // URL で決まらなければ、ヘッダ到着時（readyState 2）に Content-Type で一度だけ判定する
+        const onState = () => {
+          if (this.readyState < 2) return;
+          this.removeEventListener('readystatechange', onState);
+          let k = null;
           try {
-            if (this.responseType === '' || this.responseType === 'text') text = this.responseText;
+            k = classifyByType(this.getResponseHeader('content-type'));
           } catch (_) {}
-          recordPlaylist(url, ms, this.status, text);
-        } else {
-          recordSegment(url, e.loaded || byteLengthOf(this), ms, this.status, t0);
-        }
-      });
+          if (k) watchXhr(this, k, url, range, t0);
+        };
+        this.addEventListener('readystatechange', onState);
+      }
     }
     return xhrSend.apply(this, arguments);
   };
+
+  function watchXhr(xhr, kind, url, range, t0) {
+    // loadend は本文を受け切ってから発火するので、そのままDL時間になる
+    xhr.addEventListener('loadend', (e) => {
+      const ms = performance.now() - t0;
+      if (kind === 'playlist') {
+        let text = '';
+        try {
+          if (xhr.responseType === '' || xhr.responseType === 'text') text = xhr.responseText;
+        } catch (_) {}
+        recordPlaylist(url, ms, xhr.status, text);
+      } else {
+        recordSegment(url, e.loaded || byteLengthOf(xhr), ms, xhr.status, t0, range, kind);
+      }
+    });
+  }
 
   function byteLengthOf(xhr) {
     try {
@@ -507,7 +675,8 @@
     // 未判定・不明は「除外しない」側に倒す（測れた可能性を捨てないため）。
     // 計測できたと言えるのは「キャッシュと判定されておらず」かつ「初回取得」のもの。
     // 判定不能でも再取得なら回線の実力は測れていないので外す。
-    const measured = segments.filter((s) => s.bytes > 0 && s.ms > 0 && s.cached !== true && !s.repeat);
+    // init（#EXT-X-MAP）は尺を持たない小さな取得なので、回線の計測にも使わない。
+    const measured = segments.filter((s) => s.kind !== 'init' && s.bytes > 0 && s.ms > 0 && s.cached !== true && !s.repeat);
     const recent = measured.slice(-SEG_WINDOW);
 
     let downloadBps = null;
@@ -551,6 +720,8 @@
       codecs: v?.codecs ?? null,
       switches: variantSwitches,
       downloadBps,
+      /** 直近の取得の種別（segment / init）。書き出しで init を見分けるため */
+      segKind: newest ? newest.kind : null,
       segBytes: last?.bytes ?? null,
       segMs: last?.ms ?? null,
       /*

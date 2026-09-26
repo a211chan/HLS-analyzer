@@ -10,6 +10,7 @@ __pycache__/
 
 # 検証用に ffmpeg で生成する HLS（test/make-stream.sh で作り直せる）
 test/stream/
+test/stream-fmp4/
 
 # Chrome ウェブストア提出用 zip（scripts/package.sh で作り直せる）
 dist/

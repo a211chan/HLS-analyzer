@@ -7,7 +7,19 @@
   const video = document.getElementById('v');
   const logEl = document.getElementById('log');
   const levelsEl = document.getElementById('levels');
-  const SRC = 'stream/master.m3u8';
+  /*
+   * ?src= で配信形態を切り替える（test/serve.py のモード）。
+   *   noext     拡張子なし・トークン付き・octet-stream
+   *   byterange 1ファイルを #EXT-X-BYTERANGE で分割
+   *   fmp4      fMP4（#EXT-X-MAP の init を持つ）。make-stream.sh が作る
+   */
+  const MODE = new URLSearchParams(location.search).get('src');
+  const SRC =
+    MODE === 'noext' || MODE === 'byterange'
+      ? `/hls/${MODE}/master`
+      : MODE === 'fmp4'
+        ? 'stream-fmp4/index.m3u8'
+        : 'stream/master.m3u8';
 
   const log = (m) => {
     const t = new Date().toTimeString().slice(0, 8);

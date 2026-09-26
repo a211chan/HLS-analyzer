@@ -39,7 +39,24 @@ ffmpeg -hide_banner -loglevel error \
   -var_stream_map "v:0,a:0 v:1,a:1 v:2,a:2" \
   "$OUT/v%v/index.m3u8"
 
+# fMP4（#EXT-X-MAP の init を持つ）の単一バリアント。init を尺の無いセグメントとして
+# 数えてしまわないかの検証用（#1）。
+FMP4="$HERE/stream-fmp4"
+rm -rf "$FMP4"
+mkdir -p "$FMP4"
+ffmpeg -hide_banner -loglevel error \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+  -t "$DUR" \
+  -c:v libx264 -b:v 2800k -x264-params "keyint=60:min-keyint=60:scenecut=0" -preset veryfast \
+  -c:a aac -b:a 128k -ac 2 \
+  -f hls -hls_time 4 -hls_playlist_type vod -hls_list_size 0 \
+  -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 \
+  -hls_segment_filename "$FMP4/seg%03d.m4s" \
+  "$FMP4/index.m3u8"
+
 echo
 echo "生成しました: $OUT"
 find "$OUT" -name '*.m3u8' | sort | sed "s|$HERE/|  test/|"
 echo "  セグメント $(find "$OUT" -name '*.ts' | wc -l | tr -d ' ') 個 / 合計 $(du -sh "$OUT" | cut -f1)"
+echo "  fMP4: test/stream-fmp4/index.m3u8（$(find "$FMP4" -name '*.m4s' | wc -l | tr -d ' ') セグメント + init.mp4）"
