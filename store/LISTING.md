@@ -55,23 +55,23 @@ Web ページ上で再生されている HLS ストリームの再生品質を�
 
 ## 審査担当者向けテスト手順（ダッシュボードの「テスト手順」欄に貼る）
 
-ログインやアカウントは不要です。公開されている hls.js のデモページで確認できます。
+公開されている hls.js のデモページで確認できる。
 
 ```
-No login or account is required.
+ログインやアカウントは不要です。
 
-1. Install the extension and open this public hls.js demo page:
+1. 拡張機能をインストールし、公開されている hls.js のデモページを開きます。
    https://hlsjs.video-dev.org/demo/?src=https%3A%2F%2Ftest-streams.mux.dev%2Fx36xhzz%2Fx36xhzz.m3u8
-2. Start playback if it does not start automatically.
-   Within a few seconds a small "HLS ANALYZER" overlay appears at the top right of the page,
-   showing variant, resolution, fps, buffer, headroom, download speed, stall, etc.
-3. Click the toolbar icon to hide / show the overlay.
-4. Click "⤓" in the overlay and choose "CSV で保存" (Save as CSV) to download the measured history.
-5. Click "⚙" to open the options page. Reload the demo page once, then reopen the options page:
-   the previous session is listed under "保存済みの履歴" (Saved history) and can be exported or deleted.
-6. (Optional) Click "⧉" to move the overlay into a Picture-in-Picture window.
+2. 自動で再生されない場合は再生を開始してください。
+   数秒でページ右上に「HLS ANALYZER」の小窓が表示され、variant・解像度・fps・buffer・
+   余裕度・DL速度・stall などが表示されます。
+3. ツールバーのアイコンをクリックすると、小窓の表示 / 非表示が切り替わります。
+4. 小窓の「⤓」→「CSV で保存」で、計測履歴がダウンロードされます。
+5. 「⚙」で設定画面が開きます。デモページを一度リロードしてから設定画面を開き直すと、
+   「保存済みの履歴」に前回のセッションが表示され、書き出し・削除ができます。
+6. （任意）「⧉」で小窓を Picture-in-Picture の別ウィンドウに移せます。
 
-The overlay only appears on pages that play HLS. No data is sent anywhere.
+小窓は HLS を再生しているページにだけ表示されます。データは一切外部へ送信しません。
 ```
 
 ## 提出前の自己確認手順
