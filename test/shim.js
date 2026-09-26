@@ -28,12 +28,6 @@
           ui = { pos: msg.pos || null };
           return Promise.resolve();
         }
-        if (msg?.type === 'log-append') {
-          // 実物は storage.session に溜める。ここでは届いた行数だけ見えれば十分。
-          const n = msg.streams.reduce((a, st) => a + st.samples.length, 0);
-          console.log('[shim] log-append', n, 'rows');
-          return Promise.resolve();
-        }
 
         // sw.js と同じ振る舞い: frameId を付けて折り返す
         const payload = { ...msg, frameId: 0 };
@@ -46,8 +40,11 @@
       local: {
         get(keys) {
           const out = {};
-          for (const k of [].concat(keys)) if (k in store) out[k] = store[k];
+          for (const k of keys == null ? Object.keys(store) : [].concat(keys)) if (k in store) out[k] = store[k];
           return Promise.resolve(out);
+        },
+        getKeys() {
+          return Promise.resolve(Object.keys(store));
         },
         set(obj) {
           const changes = {};
@@ -101,4 +98,6 @@
       },
     },
   };
+  // 検証用に中身を覗けるようにしておく
+  window.__shimStore = store;
 })();
