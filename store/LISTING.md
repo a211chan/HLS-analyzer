@@ -52,3 +52,53 @@ Web ページ上で再生されている HLS ストリームの再生品質を�
 4. 「ストアの掲載情報」に上の詳細説明・カテゴリ・言語・画像を入力
 5. 「プライバシーへの取り組み」に単一用途・権限の正当化・データ使用の申告を入力
 6. 「配布」で公開範囲（公開 / 限定公開）を選び、審査に提出
+
+## 審査担当者向けテスト手順（ダッシュボードの「テスト手順」欄に貼る）
+
+ログインやアカウントは不要です。公開されている hls.js のデモページで確認できます。
+
+```
+No login or account is required.
+
+1. Install the extension and open this public hls.js demo page:
+   https://hlsjs.video-dev.org/demo/?src=https%3A%2F%2Ftest-streams.mux.dev%2Fx36xhzz%2Fx36xhzz.m3u8
+2. Start playback if it does not start automatically.
+   Within a few seconds a small "HLS ANALYZER" overlay appears at the top right of the page,
+   showing variant, resolution, fps, buffer, headroom, download speed, stall, etc.
+3. Click the toolbar icon to hide / show the overlay.
+4. Click "⤓" in the overlay and choose "CSV で保存" (Save as CSV) to download the measured history.
+5. Click "⚙" to open the options page. Reload the demo page once, then reopen the options page:
+   the previous session is listed under "保存済みの履歴" (Saved history) and can be exported or deleted.
+6. (Optional) Click "⧉" to move the overlay into a Picture-in-Picture window.
+
+The overlay only appears on pages that play HLS. No data is sent anywhere.
+```
+
+## 提出前の自己確認手順
+
+リポジトリの検証ページを使う。**提出する zip を展開したものを読み込むこと**（作業ツリーではなく、実際に出すファイルで確かめる）。
+
+1. 準備
+   ```bash
+   ./test/make-stream.sh 48
+   ./scripts/package.sh
+   rm -rf /tmp/hla-check && mkdir /tmp/hla-check && unzip -q dist/hls-analyzer-*.zip -d /tmp/hla-check
+   python3 test/serve.py
+   ```
+2. `chrome://extensions` → デベロッパーモード ON →「パッケージ化されていない拡張機能を読み込む」で `/tmp/hla-check` を選ぶ（開発版を読み込んでいれば先に無効化）
+3. 次を順に確認する
+
+| # | 開くページ / 操作 | 期待する結果 |
+|---|---|---|
+| 1 | http://localhost:8732/test/loopback.html | 右上に小窓。variant・解像度・buffer・余裕度・DL速度が出る |
+| 2 | バリアントのボタンを押す | 「切替」が増え、variant 表示が追随する |
+| 3 | `?src=noext` を付けて開く | 1 と同じ項目が出る（拡張子なしURLでも DL速度・余裕度が空欄にならない） |
+| 4 | `?src=byterange` | 同上 |
+| 5 | `?src=fmp4` | 余裕度・DL速度が出る（init で桁が狂わない） |
+| 6 | ツールバーのアイコン | 小窓の表示 / 非表示 |
+| 7 | `⤓` → CSV で保存 | ダウンロードされ、Excel で文字化けしない。`segment_kind` 列がある |
+| 8 | `⧉` → 「video を直接全画面」 | 別ウィンドウの小窓が全画面の上に見える。⧉ をもう一度押すと戻る |
+| 9 | ページをリロード → `⚙` | 「保存済みの履歴」に前のセッションがあり、CSV / JSON / 削除ができる |
+| 10 | 2つのタブで開き、片方の小窓をドラッグ | もう片方の小窓は動かない |
+| 11 | 公開デモ（上の審査用 URL） | 審査担当者と同じ手順で小窓が出る |
+| 12 | HLS 以外のページ（例: https://example.com） | 小窓は出ない。コンソールにエラーが出ない |
