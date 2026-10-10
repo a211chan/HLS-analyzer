@@ -12,6 +12,7 @@
  * src/report/report.html を、合成した履歴で描画する。拡張を読み込まずに見た目を確かめるためのページ。
  *   ?mode=good|warn|bad   1セッションの判定別
  *   ?mode=multi           3セッションを1冊にまとめる
+ *   ?mode=overlay         小窓から開いたとき（storage.session 経由の ?r=）
  */
 (async () => {
   const load = (src) => new Promise((res, rej) => {
@@ -25,6 +26,17 @@
   await load('../src/common/export.js');
 
   const mode = new URLSearchParams(location.search).get('mode') || 'warn';
+  if (mode === 'overlay') {
+    // 保存済みの履歴に入れたものを読み戻し、sw.js と同じ形で storage.session に預ける
+    const id = await seed('bad', Date.now() - 1800000);
+    const s = (await HLA_EXPORT.listSessions()).find((x) => x.id === id);
+    const rows = await HLA_EXPORT.loadRows(s);
+    await HLA_EXPORT.removeSessions([s]);
+    await chrome.storage.session.set({ ['hla:r:' + id]: { host: s.host, rows } });
+    history.replaceState(null, '', location.pathname + '?r=' + id);
+    await load('../src/report/report.js');
+    return;
+  }
   const kinds = mode === 'multi' ? ['good', 'warn', 'bad'] : [mode];
   const ids = [];
   let t0 = Date.now() - 3 * 3600000;

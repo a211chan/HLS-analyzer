@@ -1,10 +1,12 @@
 /*
  * HLS Analyzer — Service Worker
  *
- * 役割は3つ。
+ * 役割は4つ。
  *   1. 各フレームの bridge.js から届いたメトリクスを、描画すべきフレームへ転送する
  *   2. ツールバーアイコンのクリックで表示ON/OFFを切り替える
  *   3. 小窓の位置をタブ単位で覚える
+ *   4. 小窓から頼まれた品質レポートのタブを開く
+ *   5. 自動起動（インストール時・ブラウザ起動時に表示状態を揃える）と、アイコンの ON バッジ
  *
  * SW は非アクティブ化されるので、状態はすべて chrome.storage に置く。
  *   - 表示ON/OFFと設定 : storage.local（全タブ共通。各フレームは onChanged で追従する）
@@ -20,6 +22,9 @@ const FILENAME = /^hls-\d{8}-\d{6}\.(csv|json)$/;
 /** 小窓の位置。タブごとに1件 */
 const UI_KEY = (tabId) => `ui:${tabId}`;
 
+/** 小窓から開くレポートの行。report.js が読んだら消す */
+const REPORT_KEY = (id) => `hla:r:${id}`;
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.__hlaChannel !== CHANNEL) return;
 
@@ -33,6 +38,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'download') {
     save(msg).then(sendResponse);
     return true; // 非同期で応答する
+  }
+
+  // 品質レポート。コンテンツスクリプトは storage.session を読めず tabs.create も呼べないので、ここで預かる
+  if (msg.type === 'report') {
+    openReport(msg).then(sendResponse);
+    return true;
   }
 
   const tabId = sender.tab?.id;
@@ -81,6 +92,19 @@ async function save(msg) {
   }
 }
 
+async function openReport(msg) {
+  try {
+    if (!Array.isArray(msg.rows) || !msg.rows.length) throw new Error('履歴がありません');
+    const id = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    const host = typeof msg.host === 'string' ? msg.host.slice(0, 253) : 'page';
+    await chrome.storage.session.set({ [REPORT_KEY(id)]: { host, rows: msg.rows } });
+    await chrome.tabs.create({ url: chrome.runtime.getURL('src/report/report.html') + '?r=' + id });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
 function send(tabId, payload, frameId) {
   chrome.tabs.sendMessage(tabId, payload, { frameId }).catch(() => {
     // 該当フレームにオーバーレイが未注入 / 遷移直後などは黙って捨てる
@@ -93,6 +117,30 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.action.onClicked.addListener(async () => {
-  const { enabled = true } = await chrome.storage.local.get('enabled');
+  const { enabled = false } = await chrome.storage.local.get('enabled');
   await chrome.storage.local.set({ enabled: !enabled });
+});
+
+/*
+ * 自動起動。インストール直後とブラウザ起動時に、enabled を autoStart に揃える。
+ * autoStart が OFF（既定）なら、ユーザーがアイコンか設定画面で ON にするまで小窓は出ない。
+ */
+async function applyAutoStart() {
+  const { autoStart = false } = await chrome.storage.local.get('autoStart');
+  await chrome.storage.local.set({ enabled: autoStart === true });
+}
+chrome.runtime.onInstalled.addListener((d) => {
+  // 拡張の更新やChrome自体の更新では、いまの表示状態を勝手に変えない
+  if (d.reason === 'install') applyAutoStart();
+});
+chrome.runtime.onStartup.addListener(applyAutoStart);
+
+/** ツールバーアイコンに現在の状態を出す */
+function paintBadge(enabled) {
+  chrome.action.setBadgeText({ text: enabled ? 'ON' : '' });
+  chrome.action.setBadgeBackgroundColor({ color: '#2e7d32' });
+}
+chrome.storage.local.get('enabled').then((v) => paintBadge(v.enabled === true));
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.enabled) paintBadge(changes.enabled.newValue === true);
 });

@@ -107,6 +107,9 @@
     $('persistHours').value = cfg.persistHours;
     $('sparkline').checked = !!cfg.sparkline;
     $('alerts').checked = !!cfg.alerts;
+    $('autoStart').checked = !!cfg.autoStart;
+    $('toggleEnabled').textContent = cfg.enabled ? 'OFFにする' : 'ONにする';
+    $('enabledState').textContent = cfg.enabled ? '現在: ON' : '現在: OFF';
 
     for (const el of document.querySelectorAll('[data-field]')) {
       el.checked = cfg.fields[el.dataset.field] !== false;
@@ -141,6 +144,7 @@
     next.persistHours = clampInt($('persistHours').value, 1, 720, DEFAULTS.persistHours);
     next.sparkline = $('sparkline').checked;
     next.alerts = $('alerts').checked;
+    next.autoStart = $('autoStart').checked;
 
     for (const el of document.querySelectorAll('[data-field]')) {
       next.fields[el.dataset.field] = el.checked;
@@ -278,6 +282,16 @@
     cfg = merge(await chrome.storage.local.get(KEYS));
     paint();
     await paintSessions();
+
+    $('toggleEnabled').addEventListener('click', async () => {
+      await chrome.storage.local.set({ enabled: !cfg.enabled });
+    });
+    // アイコンや小窓の × で切り替わったときもボタン表示を追従させる
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes.enabled) return;
+      cfg.enabled = changes.enabled.newValue === true;
+      paint();
+    });
 
     document.addEventListener('change', (e) => {
       // 履歴の選択チェックは設定ではない
