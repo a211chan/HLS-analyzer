@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>HLS Analyzer — レポートプレビュー（拡張なし）</title>
+<link rel="stylesheet" href="../src/report/report.css">
+<script src="shim.js"></script>
+</head>
+<body>
+<script>
+/*
+ * src/report/report.html を、合成した履歴で描画する。拡張を読み込まずに見た目を確かめるためのページ。
+ *   ?mode=good|warn|bad   1セッションの判定別
+ *   ?mode=multi           3セッションを1冊にまとめる
+ */
+(async () => {
+  const load = (src) => new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
+  const html = await (await fetch('../src/report/report.html')).text();
+  document.body.innerHTML = new DOMParser().parseFromString(html, 'text/html').body.innerHTML;
+  await load('../src/common/config.js');
+  await load('../src/common/export.js');
+
+  const mode = new URLSearchParams(location.search).get('mode') || 'warn';
+  const kinds = mode === 'multi' ? ['good', 'warn', 'bad'] : [mode];
+  const ids = [];
+  let t0 = Date.now() - 3 * 3600000;
+  for (const kind of kinds) {
+    ids.push(await seed(kind, t0));
+    t0 += 3600000;
+  }
+  history.replaceState(null, '', location.pathname + '?s=' + ids.join(','));
+  await load('../src/report/report.js');
+
+  async function seed(kind, start) {
+    const V = [[800e3, '640x360'], [2.5e6, '1280x720'], [5e6, '1920x1080']];
+    const session = { id: HLA_EXPORT.newSessionId(), host: 'live.example.com', start, end: start, rows: 0, chunks: 0 };
+    const rows = [];
+    let stalls = 0, stallSec = 0, freezes = 0, freezeSec = 0, errors = 0, switches = 0, vi = 2;
+    const N = 1800;
+    for (let i = 0; i < N; i++) {
+      const t = start + i * 1000;
+      // 不調の区間: warn は 600〜660 秒で帯域が落ちる / bad はさらに停止とエラー
+      const dip = kind !== 'good' && i > 600 && i < 660;
+      const outage = kind === 'bad' && ((i > 1200 && i < 1215) || (i > 1500 && i < 1508));
+      let dl = (kind === 'good' ? 14e6 : 9e6) + Math.sin(i / 37) * 1.5e6;
+      if (dip) dl = 2.2e6;
+      if (outage) dl = 0.9e6;
+      const want = dl > 6.5e6 ? 2 : dl > 3e6 ? 1 : 0;
+      if (want !== vi && i % 5 === 0) { vi = want; switches++; }
+      let buf = 18 + Math.sin(i / 50) * 3;
+      if (dip) buf = Math.max(1.5, 18 - (i - 600) * 0.4);
+      let state = i < 3 ? 'paused' : 'playing';
+      if (outage) { buf = 0.2; state = 'stalled'; stallSec += 1; if ((i === 1201) || (i === 1501)) stalls++; }
+      if (kind === 'bad' && (i === 1199 || i === 1499)) errors++;
+      if (kind !== 'good' && i === 900) { freezes++; freezeSec += 1.4; }
+      rows.push(['0', {
+        t, state, live: true, w: +V[vi][1].split('x')[0], h: +V[vi][1].split('x')[1], fps: 29.97,
+        bufferSec: i < 3 ? 0 : buf, latencySec: 12 + (kind === 'bad' ? stallSec * 2.5 : 0) + Math.sin(i / 90),
+        stalls, stallSec, freezes, freezeSec, visible: !(i > 1300 && i < 1400 && kind === 'good'),
+        droppedPct: kind === 'bad' ? 1.5 + Math.abs(Math.sin(i / 20)) * 6 : 0.1 + Math.abs(Math.sin(i / 60)) * 0.5,
+        cached: false, repeat: false, variantIndex: vi, variantCount: 3, variantBps: V[vi][0], variantRes: V[vi][1],
+        codecs: 'avc1.64001f,mp4a.40.2', switches, downloadBps: dl, segKind: 'media', segBytes: V[vi][0] / 8 * 4,
+        segMs: (V[vi][0] * 4) / dl * 1000, segDur: 4, targetDur: 4, headroom: dl / V[vi][0], plReloadSec: 4, errors,
+      }]);
+    }
+    for (let i = 0; i < rows.length; i += 300) {
+      await HLA_EXPORT.writeChunk(session, { 0: { host: session.host, frame: 0 } }, rows.slice(i, i + 300));
+    }
+    return session.id;
+  }
+})();
+</script>
+</body>
+</html>

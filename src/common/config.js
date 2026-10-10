@@ -68,17 +68,49 @@
       /** 直近1サンプルでの HTTP エラー増分(件) */
       errors: { dir: 'above', warn: 1, crit: 1 },
     },
+
+    /*
+     * 品質レポート（印刷用HTML → ブラウザの「PDFに保存」）。
+     * 判定は上の thresholds をそのまま使う。レポート専用のしきい値は持たない。
+     */
+    report: {
+      /** 表紙に出す題名 */
+      title: 'HLS 再生品質レポート',
+      /** 作成者・提出先など。空なら出さない */
+      author: '',
+      /** 複数セッションを選んだとき: 'combined' = 1冊にまとめる / 'separate' = セッションごとに別タブ */
+      mode: 'combined',
+      /** 出す章。false にすると章ごと省く */
+      sections: {
+        summary: true,
+        kpi: true,
+        judgement: true,
+        charts: true,
+        events: true,
+        stream: true,
+        conditions: true,
+        criteria: true,
+      },
+      /** 時系列グラフの種類 */
+      charts: {
+        buffer: true,
+        bitrate: true,
+        headroom: true,
+        latency: true,
+        dropped: true,
+      },
+    },
   };
 
   const KEYS = Object.keys(DEFAULTS);
 
-  /** 保存済みの値を既定値に重ねる。入れ子（fields / thresholds）は項目単位でマージする */
+  /** 保存済みの値を既定値に重ねる。入れ子（fields / thresholds / report）は項目単位でマージする */
   function merge(stored) {
     const out = structuredClone(DEFAULTS);
     if (!stored) return out;
 
     for (const k of KEYS) {
-      if (k === 'fields' || k === 'thresholds') continue;
+      if (k === 'fields' || k === 'thresholds' || k === 'report') continue;
       if (stored[k] != null) out[k] = stored[k];
     }
     if (stored.fields) {
@@ -92,6 +124,18 @@
         // dir は保存値で上書きさせない
         if ('warn' in v) out.thresholds[k].warn = v.warn;
         if ('crit' in v) out.thresholds[k].crit = v.crit;
+      }
+    }
+    const r = stored.report;
+    if (r && typeof r === 'object') {
+      if (typeof r.title === 'string') out.report.title = r.title;
+      if (typeof r.author === 'string') out.report.author = r.author;
+      if (r.mode === 'combined' || r.mode === 'separate') out.report.mode = r.mode;
+      for (const g of ['sections', 'charts']) {
+        if (!r[g]) continue;
+        for (const [k, v] of Object.entries(r[g])) {
+          if (k in out.report[g]) out.report[g][k] = v === true;
+        }
       }
     }
     return out;

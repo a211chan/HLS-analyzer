@@ -38,6 +38,25 @@
     ['errors', 'HTTPエラー', '件', '直近1サンプルでの HTTP エラー増分（累積値ではない）'],
   ];
 
+  /** レポートの章。DEFAULTS.report.sections のキーと対応する */
+  const REPORT_SECTIONS = {
+    summary: '総合判定と所見（文章）',
+    kpi: '主要指標（数値カード）',
+    judgement: 'しきい値判定の表',
+    charts: '時系列グラフ',
+    events: 'イベント一覧（停止・フリーズ・エラー・画質切替）',
+    stream: '配信構成（バリアント・コーデック・セグメント尺）',
+    conditions: '計測条件（間隔・非表示時間など）',
+    criteria: '判定基準（しきい値の一覧）',
+  };
+  const REPORT_CHARTS = {
+    buffer: 'バッファ長',
+    bitrate: 'ビットレートとDL速度',
+    headroom: '余裕度',
+    latency: 'ライブ遅延（LIVEのみ）',
+    dropped: 'ドロップフレーム率',
+  };
+
   const $ = (id) => document.getElementById(id);
   const statusEl = $('status');
 
@@ -69,6 +88,15 @@
     }).join('');
   }
 
+  function buildReport() {
+    const box = (attr, labels) =>
+      Object.entries(labels)
+        .map(([k, l]) => `<label class="field"><input type="checkbox" ${attr}="${k}"> ${escapeHtml(l)}</label>`)
+        .join('');
+    $('reportSections').innerHTML = box('data-rsec', REPORT_SECTIONS);
+    $('reportCharts').innerHTML = box('data-rchart', REPORT_CHARTS);
+  }
+
   // ------------------------------------------------------------ 反映
 
   function paint() {
@@ -87,6 +115,14 @@
       const v = cfg.thresholds[el.dataset.th]?.[el.dataset.lv];
       el.value = v == null ? '' : v;
     }
+
+    $('reportTitle').value = cfg.report.title;
+    $('reportAuthor').value = cfg.report.author;
+    for (const el of document.querySelectorAll('input[name="reportMode"]')) el.checked = el.value === cfg.report.mode;
+    for (const el of document.querySelectorAll('[data-rsec]')) el.checked = cfg.report.sections[el.dataset.rsec] !== false;
+    for (const el of document.querySelectorAll('[data-rchart]')) el.checked = cfg.report.charts[el.dataset.rchart] !== false;
+    // グラフの章を外したら、グラフの種類は選んでも意味がない
+    for (const el of document.querySelectorAll('[data-rchart]')) el.disabled = !cfg.report.sections.charts;
 
     // スパークラインOFFなら範囲指定は意味がない
     $('sparkSeconds').disabled = !cfg.sparkline;
@@ -114,6 +150,11 @@
       const v = raw === '' ? null : Number(raw);
       next.thresholds[el.dataset.th][el.dataset.lv] = Number.isFinite(v) ? v : null;
     }
+    next.report.title = $('reportTitle').value.trim() || DEFAULTS.report.title;
+    next.report.author = $('reportAuthor').value.trim();
+    next.report.mode = document.querySelector('input[name="reportMode"]:checked')?.value || DEFAULTS.report.mode;
+    for (const el of document.querySelectorAll('[data-rsec]')) next.report.sections[el.dataset.rsec] = el.checked;
+    for (const el of document.querySelectorAll('[data-rchart]')) next.report.charts[el.dataset.rchart] = el.checked;
     return next;
   }
 
@@ -150,20 +191,23 @@
 
   async function paintSessions() {
     sessions = await listSessions();
+    $('pickAll').checked = false;
     const tbody = document.querySelector('#sessions tbody');
     if (!sessions.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="desc">まだありません</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="desc">まだありません</td></tr>';
       return;
     }
     tbody.innerHTML = sessions
       .map(
         (s, i) => `
       <tr>
+        <td><input type="checkbox" data-pick="${i}"></td>
         <td>${escapeHtml(localStamp(s.start).slice(0, 19))}</td>
         <td>${escapeHtml(localStamp(s.end).slice(0, 19))}</td>
         <td class="name">${escapeHtml(s.host)}</td>
         <td>${s.rows}</td>
         <td class="ops">
+          <button data-sess="${i}" data-op="report">レポート</button>
           <button data-sess="${i}" data-op="csv">CSV</button>
           <button data-sess="${i}" data-op="json">JSON</button>
           <button data-sess="${i}" data-op="del" class="danger">削除</button>
@@ -179,6 +223,10 @@
     const s = sessions[Number(btn.dataset.sess)];
     if (!s) return;
     const op = btn.dataset.op;
+    if (op === 'report') {
+      openReports([s]);
+      return;
+    }
     if (op === 'del') {
       await removeSessions([s]);
       await paintSessions();
@@ -196,17 +244,44 @@
     flash(`${rows.length} 行を書き出しました`);
   }
 
+  /*
+   * レポートは拡張内のページ（src/report/report.html）として開く。
+   * セッションIDだけを URL で渡し、中身は向こうで storage から読み直す。
+   * 「分ける」ときはセッションごとにタブを開き、それぞれで印刷→PDF保存してもらう。
+   */
+  function openReports(list) {
+    if (!list.length) {
+      flash('セッションを選んでください');
+      return;
+    }
+    const groups = cfg.report.mode === 'separate' ? list.map((s) => [s]) : [list];
+    for (const g of groups) {
+      const url = chrome.runtime.getURL('src/report/report.html') + '?s=' + g.map((s) => encodeURIComponent(s.id)).join(',');
+      chrome.tabs.create({ url });
+    }
+  }
+
+  function picked() {
+    return [...document.querySelectorAll('#sessions tbody [data-pick]:checked')]
+      .map((el) => sessions[Number(el.dataset.pick)])
+      .filter(Boolean)
+      // レポートの中では古い順に並べる
+      .sort((a, b) => a.start - b.start);
+  }
+
   // ------------------------------------------------------------ 起動
 
   (async () => {
     buildFields();
     buildThresholds();
+    buildReport();
     cfg = merge(await chrome.storage.local.get(KEYS));
     paint();
     await paintSessions();
 
     document.addEventListener('change', (e) => {
-      if (e.target.matches('input')) save();
+      // 履歴の選択チェックは設定ではない
+      if (e.target.matches('input:not([data-pick])')) save();
     });
 
     $('reset').addEventListener('click', async () => {
@@ -218,6 +293,10 @@
 
     document.querySelector('#sessions').addEventListener('click', onSession);
     $('refreshSessions').addEventListener('click', paintSessions);
+    $('reportSelected').addEventListener('click', () => openReports(picked()));
+    $('pickAll').addEventListener('change', (e) => {
+      for (const el of document.querySelectorAll('#sessions tbody [data-pick]')) el.checked = e.target.checked;
+    });
     $('clearSessions').addEventListener('click', async () => {
       if (!confirm('保存済みの履歴をすべて削除しますか？')) return;
       await removeSessions(await listSessions());
