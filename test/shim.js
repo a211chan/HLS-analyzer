@@ -9,6 +9,8 @@
   const msgListeners = [];
   const changeListeners = [];
   const store = Object.create(null);
+  // 拡張の既定は表示OFF（アイコンか設定画面で ON にする）。検証ページでは最初から出しておく
+  store.enabled = true;
   // storage.session 相当。実物と同じくメモリ上にしか無い
   const session = Object.create(null);
   // 小窓の位置。実物は storage.session にタブ単位で持つ

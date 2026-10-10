@@ -6,6 +6,7 @@
  *   2. ツールバーアイコンのクリックで表示ON/OFFを切り替える
  *   3. 小窓の位置をタブ単位で覚える
  *   4. 小窓から頼まれた品質レポートのタブを開く
+ *   5. 自動起動（インストール時・ブラウザ起動時に表示状態を揃える）と、アイコンの ON バッジ
  *
  * SW は非アクティブ化されるので、状態はすべて chrome.storage に置く。
  *   - 表示ON/OFFと設定 : storage.local（全タブ共通。各フレームは onChanged で追従する）
@@ -116,6 +117,30 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.action.onClicked.addListener(async () => {
-  const { enabled = true } = await chrome.storage.local.get('enabled');
+  const { enabled = false } = await chrome.storage.local.get('enabled');
   await chrome.storage.local.set({ enabled: !enabled });
+});
+
+/*
+ * 自動起動。インストール直後とブラウザ起動時に、enabled を autoStart に揃える。
+ * autoStart が OFF（既定）なら、ユーザーがアイコンか設定画面で ON にするまで小窓は出ない。
+ */
+async function applyAutoStart() {
+  const { autoStart = false } = await chrome.storage.local.get('autoStart');
+  await chrome.storage.local.set({ enabled: autoStart === true });
+}
+chrome.runtime.onInstalled.addListener((d) => {
+  // 拡張の更新やChrome自体の更新では、いまの表示状態を勝手に変えない
+  if (d.reason === 'install') applyAutoStart();
+});
+chrome.runtime.onStartup.addListener(applyAutoStart);
+
+/** ツールバーアイコンに現在の状態を出す */
+function paintBadge(enabled) {
+  chrome.action.setBadgeText({ text: enabled ? 'ON' : '' });
+  chrome.action.setBadgeBackgroundColor({ color: '#2e7d32' });
+}
+chrome.storage.local.get('enabled').then((v) => paintBadge(v.enabled === true));
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.enabled) paintBadge(changes.enabled.newValue === true);
 });
