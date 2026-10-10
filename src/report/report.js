@@ -4,7 +4,8 @@
  * 保存済みの履歴（hla:s: / hla:c:）から印刷用のHTMLを組み立てる。
  * PDF化はブラウザの印刷（「PDFに保存」）に任せるので、ライブラリもフォントも同梱しない。
  *
- * URL: report.html?s=<sessionId>,<sessionId>...
+ * URL: report.html?s=<sessionId>,<sessionId>...   設定画面の保存済み履歴から
+ *      report.html?r=<id>                         小窓から（行は SW が storage.session に預けたもの）
  *   複数あれば1冊にまとめる（冒頭に比較表）。分けるかどうかは設定画面が決め、
  *   分けるときはセッションごとにこのページを開く。
  *
@@ -54,7 +55,19 @@
     const root = $('report');
     try {
       const cfg = merge(await chrome.storage.local.get(KEYS));
-      const ids = (new URLSearchParams(location.search).get('s') || '').split(',').filter(Boolean);
+      const q = new URLSearchParams(location.search);
+      const tmp = q.get('r');
+      if (tmp) {
+        const sessions = await fromOverlay(tmp, cfg);
+        if (!sessions) {
+          root.innerHTML = '<p class="loading">レポートのデータが見つかりません。小窓のメニューからもう一度開いてください。</p>';
+          return;
+        }
+        root.innerHTML = render(sessions, cfg);
+        document.title = `hls-report-${fileStamp(sessions[0].players[0]?.start)}`;
+        return;
+      }
+      const ids = (q.get('s') || '').split(',').filter(Boolean);
       const all = await listSessions();
       const picked = ids.map((id) => all.find((s) => s.id === id)).filter(Boolean).sort((a, b) => a.start - b.start);
       if (!picked.length) {
@@ -72,6 +85,30 @@
       root.innerHTML = `<p class="loading">レポートを作れませんでした: ${esc(e && e.message)}</p>`;
     }
   })();
+
+  /**
+   * 小窓から預かった行を読む。一度きりのデータなので、読んだ時点でページ内に控えて
+   * storage からは消す（リロードしても表示できるよう sessionStorage に残す）。
+   */
+  async function fromOverlay(id, cfg) {
+    const key = `hla:r:${id}`;
+    let data = null;
+    try {
+      data = JSON.parse(sessionStorage.getItem(key) || 'null');
+    } catch (_) {}
+    if (!data) {
+      data = (await chrome.storage.session.get(key))[key] || null;
+      if (!data) return null;
+      chrome.storage.session.remove(key).catch(() => {});
+      try {
+        sessionStorage.setItem(key, JSON.stringify(data));
+      } catch (_) {}
+    }
+    const rows = (data.rows || []).filter((r) => r && r.s && typeof r.s.t === 'number');
+    if (!rows.length) return null;
+    const session = { id, host: data.host, start: rows[0].s.t, end: rows[rows.length - 1].s.t };
+    return [{ session, players: analyzeSession(rows, cfg) }];
+  }
 
   // ------------------------------------------------------------ 集計
 
