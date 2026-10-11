@@ -133,6 +133,7 @@ table.grid { width: 100%; border-collapse: collapse; font-size: 9pt; }
 .lg.warn { border-color: var(--warn); }
 .lg.crit { border-color: var(--crit); }
 .lg.band { height: 9px; border: 0; background: var(--crit-bg); }
+.lg.bg { height: 9px; border: 0; background: var(--soft); outline: 1px solid var(--line); }
 .lg.err { width: 0; height: 10px; border: 0; border-left: 2px solid var(--crit); }
 
 .chart { margin: 0 0 8px; break-inside: avoid; }
@@ -151,6 +152,7 @@ table.grid { width: 100%; border-collapse: collapse; font-size: 9pt; }
 .plot .th.warn { stroke: var(--warn); }
 .plot .th.crit { stroke: var(--crit); }
 .plot .band { fill: var(--crit-bg); }
+.plot .bgband { fill: var(--soft); }
 .plot .err { stroke: var(--crit); stroke-width: 1.2; }
 
 .foot { margin-top: 18px; padding-top: 6px; border-top: 1px solid var(--line); font-size: 8pt; color: var(--dim); }

@@ -82,6 +82,8 @@
       author: '',
       /** 複数セッションを選んだとき: 'combined' = 1冊にまとめる / 'separate' = セッションごとに別タブ */
       mode: 'combined',
+      /** 裏タブの間と、戻った後の回復期間を判定から外す（ブラウザの省電力動作を品質不良と取り違えないため） */
+      excludeBackground: true,
       /** 出す章。false にすると章ごと省く */
       sections: {
         summary: true,
@@ -133,6 +135,7 @@
       if (typeof r.title === 'string') out.report.title = r.title;
       if (typeof r.author === 'string') out.report.author = r.author;
       if (r.mode === 'combined' || r.mode === 'separate') out.report.mode = r.mode;
+      if (typeof r.excludeBackground === 'boolean') out.report.excludeBackground = r.excludeBackground;
       for (const g of ['sections', 'charts']) {
         if (!r[g]) continue;
         for (const [k, v] of Object.entries(r[g])) {

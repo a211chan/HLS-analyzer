@@ -121,6 +121,7 @@
 
     $('reportTitle').value = cfg.report.title;
     $('reportAuthor').value = cfg.report.author;
+    $('reportExcludeBg').checked = !!cfg.report.excludeBackground;
     for (const el of document.querySelectorAll('input[name="reportMode"]')) el.checked = el.value === cfg.report.mode;
     for (const el of document.querySelectorAll('[data-rsec]')) el.checked = cfg.report.sections[el.dataset.rsec] !== false;
     for (const el of document.querySelectorAll('[data-rchart]')) el.checked = cfg.report.charts[el.dataset.rchart] !== false;
@@ -156,6 +157,7 @@
     }
     next.report.title = $('reportTitle').value.trim() || DEFAULTS.report.title;
     next.report.author = $('reportAuthor').value.trim();
+    next.report.excludeBackground = $('reportExcludeBg').checked;
     next.report.mode = document.querySelector('input[name="reportMode"]:checked')?.value || DEFAULTS.report.mode;
     for (const el of document.querySelectorAll('[data-rsec]')) next.report.sections[el.dataset.rsec] = el.checked;
     for (const el of document.querySelectorAll('[data-rchart]')) next.report.charts[el.dataset.rchart] = el.checked;

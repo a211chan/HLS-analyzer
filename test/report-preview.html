@@ -13,6 +13,8 @@
  *   ?mode=good|warn|bad   1セッションの判定別
  *   ?mode=multi           3セッションを1冊にまとめる
  *   ?mode=overlay         小窓から開いたとき（storage.session 経由の ?r=）
+ *   ?mode=fixture&f=名前   test/fixtures/名前.json（実機で記録した行）を小窓経由と同じ形で開く
+ *                         bg-live-muted / bg-live-audible: 裏タブの検証用。&excl=0 で除外をOFFにして比べる
  */
 (async () => {
   const load = (src) => new Promise((res, rej) => {
@@ -26,6 +28,16 @@
   await load('../src/common/export.js');
 
   const mode = new URLSearchParams(location.search).get('mode') || 'warn';
+  if (mode === 'fixture') {
+    const name = new URLSearchParams(location.search).get('f');
+    const fx = await (await fetch(`fixtures/${encodeURIComponent(name)}.json`)).json();
+    if (new URLSearchParams(location.search).get('excl') === '0') await chrome.storage.local.set({ report: { excludeBackground: false } });
+    const id = 'fx-' + name;
+    await chrome.storage.session.set({ ['hla:r:' + id]: { host: fx.rows[0].meta.host, rows: fx.rows } });
+    history.replaceState(null, '', location.pathname + '?r=' + id);
+    await load('../src/report/report.js');
+    return;
+  }
   if (mode === 'overlay') {
     // 保存済みの履歴に入れたものを読み戻し、sw.js と同じ形で storage.session に預ける
     const id = await seed('bad', Date.now() - 1800000);
