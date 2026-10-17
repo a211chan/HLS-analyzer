@@ -1,6 +1,6 @@
 # プライバシーポリシー / Privacy Policy — HLS Analyzer
 
-最終更新: 2026-09-26（v0.6.0）
+最終更新: 2026-10-10（v1.0.0）
 
 ## 収集・送信するデータ
 HLS Analyzer は、個人情報・閲覧履歴・通信内容を含め、**いかなるデータも外部へ送信しません**。テレメトリや解析 SDK は含まれていません。
@@ -12,13 +12,16 @@ HLS Analyzer は、個人情報・閲覧履歴・通信内容を含め、**い�
 - **セグメント／プレイリストの URL は保存しません**（署名付きトークンを含みうるため、計測用のメモリ内に留めます）。メディアの中身は保持せず、バイト数を数えながら読み捨てます。
 - `chrome.storage.local` には設定値と計測履歴を保存します。履歴に含まれるのはホスト名と上記の数値のみで、セグメントの URL やページのパス・クエリは含みません。最後の記録から一定時間（既定24時間）で自動的に削除され、設定画面から即時に全削除することもできます。
 - 小窓の位置は `chrome.storage.session`（メモリ上の領域）にタブ単位で保持し、ブラウザを閉じると消去されます。
+- 小窓の表示 ON/OFF と自動起動の設定は、ほかの設定値と同じく `chrome.storage.local` に保存します。自動起動は、ブラウザの起動時とインストール時にこの設定を読んで表示状態を揃えるだけで、ページの内容や閲覧履歴は参照しません。
 - エクスポートはユーザーが明示的に操作した場合にのみ、`chrome.downloads` で端末内に保存します。
+- 品質レポート（PDF）は、拡張機能内のページとして端末内で組み立てます。PDF への変換はブラウザの印刷機能で行い、外部のサービスやライブラリは使用しません。レポートに含まれるのは、上記の計測履歴（ホスト名と数値）と、ユーザーが設定画面で入力した題名・作成者のみです。
+- 小窓からレポートを開く場合、そのページの計測履歴を `chrome.storage.session`（メモリ上の領域）に一時的に置き、レポートのタブが読み込んだ時点で削除します（再読み込みに備えてレポートのタブ内にだけ控えを残し、タブを閉じると消去されます）。この受け渡しはページの DOM を経由しないため、閲覧中のサイトから内容を読み取ることはできません。
 
 ## 第三者提供
 データを第三者へ提供・販売・譲渡することはありません。
 
 ---
 
-HLS Analyzer does not collect or transmit any data off the device. To tell HLS requests apart, only the `Content-Type` response header is checked for requests whose URL is not recognizable; bodies and other headers of non-HLS requests are never read. Byte counts, timings and HTTP status of HLS playlist/segment requests, and playback numbers from `<video>`, are used only to render the on-page overlay. Segment and playlist URLs are never stored, and media content is discarded as it is counted. Settings and measurement history (host name and numbers only, auto-deleted after 24 hours by default) are stored in `chrome.storage.local`; overlay position is kept in memory-only `chrome.storage.session`. No data is sold or shared with third parties.
+HLS Analyzer does not collect or transmit any data off the device. To tell HLS requests apart, only the `Content-Type` response header is checked for requests whose URL is not recognizable; bodies and other headers of non-HLS requests are never read. Byte counts, timings and HTTP status of HLS playlist/segment requests, and playback numbers from `<video>`, are used only to render the on-page overlay. Segment and playlist URLs are never stored, and media content is discarded as it is counted. Settings and measurement history (host name and numbers only, auto-deleted after 24 hours by default) are stored in `chrome.storage.local`; overlay position is kept in memory-only `chrome.storage.session`. The overlay on/off state and the auto-start option are stored with the other settings in `chrome.storage.local`; auto-start only reads that setting at browser startup and install, and never looks at pages or browsing history. Quality reports (PDF) are built locally as an extension page and converted with the browser's own print function; they contain only the measurement history above plus the title/author the user enters in settings. When a report is opened from the overlay, the history is passed through memory-only `chrome.storage.session` (never through the page DOM) and deleted as soon as the report tab reads it (a copy stays only inside that report tab for reloads and is cleared when the tab is closed). No data is sold or shared with third parties.
 
 連絡先 / Contact: https://github.com/a211chan/HLS-analyzer/issues

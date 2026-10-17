@@ -269,6 +269,7 @@
         <button data-act="close"    title="非表示（ツールバーのアイコンで戻せます）">×</button>
       </header>
       <div class="menu" hidden>
+        <button data-act="report">品質レポート（PDF）</button>
         <button data-act="csv">CSV で保存</button>
         <button data-act="json">JSON で保存</button>
         <button data-act="clear">履歴をクリア</button>
@@ -298,6 +299,7 @@
     else if (act === 'options') chrome.runtime.sendMessage({ __hlaChannel: CHANNEL, type: 'open-options' });
     else if (act === 'export') menuEl.hidden = !menuEl.hidden;
     else if (act === 'pip') togglePip();
+    else if (act === 'report') openReport();
     else if (act === 'csv') exportFile('csv');
     else if (act === 'json') exportFile('json');
     else if (act === 'clear') {
@@ -666,6 +668,26 @@
         else note(`保存できませんでした: ${res?.error ?? '不明なエラー'}`);
       })
       .catch(() => note('保存できませんでした。拡張を再読み込みしてください'));
+  }
+
+  /*
+   * 小窓が持っている履歴（メモリ上）でレポートを開く。保存設定がOFFでも使える。
+   * 行は SW 経由で storage.session に一時的に置き、レポートのページが読んだら消す。
+   * CSV と同じく、ページの DOM には何も渡さない。
+   */
+  function openReport() {
+    const rows = HLA_EXPORT.rows(history.values());
+    if (!rows.length) {
+      note('まだ履歴がありません');
+      return;
+    }
+    chrome.runtime
+      .sendMessage({ __hlaChannel: CHANNEL, type: 'report', host: location.host || 'page', rows })
+      .then((res) => {
+        if (res && res.ok) note('レポートを別タブで開きました');
+        else note(`開けませんでした: ${res?.error ?? '不明なエラー'}`);
+      })
+      .catch(() => note('開けませんでした。拡張を再読み込みしてください'));
   }
 
   // ------------------------------------------------------------- 整形

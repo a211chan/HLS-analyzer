@@ -10,8 +10,10 @@
   if (globalThis.HLA_CONFIG) return;
 
   const DEFAULTS = {
-    /** 小窓の表示ON/OFF。ツールバーのアイコンが切り替える */
-    enabled: true,
+    /** 小窓の表示ON/OFF。ツールバーのアイコンと設定画面のボタンが切り替える */
+    enabled: false,
+    /** ブラウザ起動時・インストール時に自動で表示ONにするか。OFFなら起動のたびにOFFへ戻す */
+    autoStart: false,
     /** 集計と描画の間隔(ms)。patch.js へ postMessage で伝える */
     intervalMs: 1000,
     /** スパークライン（折れ線）を出すか */
@@ -80,6 +82,8 @@
       author: '',
       /** 複数セッションを選んだとき: 'combined' = 1冊にまとめる / 'separate' = セッションごとに別タブ */
       mode: 'combined',
+      /** 裏タブの間と、戻った後の回復期間を判定から外す（ブラウザの省電力動作を品質不良と取り違えないため） */
+      excludeBackground: true,
       /** 出す章。false にすると章ごと省く */
       sections: {
         summary: true,
@@ -131,6 +135,7 @@
       if (typeof r.title === 'string') out.report.title = r.title;
       if (typeof r.author === 'string') out.report.author = r.author;
       if (r.mode === 'combined' || r.mode === 'separate') out.report.mode = r.mode;
+      if (typeof r.excludeBackground === 'boolean') out.report.excludeBackground = r.excludeBackground;
       for (const g of ['sections', 'charts']) {
         if (!r[g]) continue;
         for (const [k, v] of Object.entries(r[g])) {

@@ -4,7 +4,8 @@
  * 保存済みの履歴（hla:s: / hla:c:）から印刷用のHTMLを組み立てる。
  * PDF化はブラウザの印刷（「PDFに保存」）に任せるので、ライブラリもフォントも同梱しない。
  *
- * URL: report.html?s=<sessionId>,<sessionId>...
+ * URL: report.html?s=<sessionId>,<sessionId>...   設定画面の保存済み履歴から
+ *      report.html?r=<id>                         小窓から（行は SW が storage.session に預けたもの）
  *   複数あれば1冊にまとめる（冒頭に比較表）。分けるかどうかは設定画面が決め、
  *   分けるときはセッションごとにこのページを開く。
  *
@@ -16,6 +17,15 @@
  *   - 回数（stall・フリーズ・HTTPエラー）
  *       期間中の合計回数をしきい値と比べる。
  *   総合判定は、重大が1つでもあれば「不良」、警告が1つでもあれば「注意」、それ以外は「良好」。
+ *
+ * 裏タブ由来の除外（cfg.report.excludeBackground、既定 ON）
+ *   タブが裏に回るとブラウザは省電力のために再生を間引く。ミュートの動画は自動で一時停止され、
+ *   ライブなら戻った時点で遅延が「裏にいた時間」だけ積み上がり、追いつく途中で停止まで起きる
+ *   （実機で再現済み）。これは配信の品質ではないので、次の区間を判定から外す。
+ *     - タブが非表示だったサンプル
+ *     - 戻った後の回復期間。非表示中に一時停止していたライブは、遅延が裏に回る前の水準に
+ *       戻るまで（最長3分）。それ以外は戻ってから数秒
+ *   外した区間で起きた停止などはイベント一覧に「裏タブ由来」として残す。
  */
 (() => {
   'use strict';
@@ -54,7 +64,19 @@
     const root = $('report');
     try {
       const cfg = merge(await chrome.storage.local.get(KEYS));
-      const ids = (new URLSearchParams(location.search).get('s') || '').split(',').filter(Boolean);
+      const q = new URLSearchParams(location.search);
+      const tmp = q.get('r');
+      if (tmp) {
+        const sessions = await fromOverlay(tmp, cfg);
+        if (!sessions) {
+          root.innerHTML = '<p class="loading">レポートのデータが見つかりません。小窓のメニューからもう一度開いてください。</p>';
+          return;
+        }
+        root.innerHTML = render(sessions, cfg);
+        document.title = `hls-report-${fileStamp(sessions[0].players[0]?.start)}`;
+        return;
+      }
+      const ids = (q.get('s') || '').split(',').filter(Boolean);
       const all = await listSessions();
       const picked = ids.map((id) => all.find((s) => s.id === id)).filter(Boolean).sort((a, b) => a.start - b.start);
       if (!picked.length) {
@@ -72,6 +94,30 @@
       root.innerHTML = `<p class="loading">レポートを作れませんでした: ${esc(e && e.message)}</p>`;
     }
   })();
+
+  /**
+   * 小窓から預かった行を読む。一度きりのデータなので、読んだ時点でページ内に控えて
+   * storage からは消す（リロードしても表示できるよう sessionStorage に残す）。
+   */
+  async function fromOverlay(id, cfg) {
+    const key = `hla:r:${id}`;
+    let data = null;
+    try {
+      data = JSON.parse(sessionStorage.getItem(key) || 'null');
+    } catch (_) {}
+    if (!data) {
+      data = (await chrome.storage.session.get(key))[key] || null;
+      if (!data) return null;
+      chrome.storage.session.remove(key).catch(() => {});
+      try {
+        sessionStorage.setItem(key, JSON.stringify(data));
+      } catch (_) {}
+    }
+    const rows = (data.rows || []).filter((r) => r && r.s && typeof r.s.t === 'number');
+    if (!rows.length) return null;
+    const session = { id, host: data.host, start: rows[0].s.t, end: rows[rows.length - 1].s.t };
+    return [{ session, players: analyzeSession(rows, cfg) }];
+  }
 
   // ------------------------------------------------------------ 集計
 
@@ -99,7 +145,8 @@
     for (let i = 1; i < n; i++) gaps.push(samples[i].t - samples[i - 1].t);
     const step = median(gaps) || 1000;
     const dt = samples.map((s, i) => (i === 0 ? step : Math.min(s.t - samples[i - 1].t, step * 3)) / 1000);
-    const holes = gaps.filter((g) => g > step * 3).length;
+    // 裏タブではブラウザがタイマーを最大1分に1回まで間引くので、非表示中の間隔は欠けに数えない
+    const holes = gaps.filter((g, i) => g > step * 3 && !(samples[i].visible === false && samples[i + 1].visible === false)).length;
 
     let totalSec = 0, playSec = 0, hiddenSec = 0, pausedSec = 0;
     let started = -1;
@@ -107,11 +154,17 @@
       totalSec += dt[i];
       if (s.state === 'playing' || s.state === 'stalled') playSec += dt[i];
       if (s.state === 'paused' || s.state === 'ended') pausedSec += dt[i];
-      if (s.visible === false) hiddenSec += dt[i];
+      // 非表示の時間は間引かれた間隔をそのまま足す（重み用の dt は上限で切ってあるため）
+      if (s.visible === false) hiddenSec += i === 0 ? step / 1000 : (s.t - samples[i - 1].t) / 1000;
       if (started < 0 && s.state === 'playing') started = i;
     });
     const live = samples.some((s) => s.live === true);
     const th = cfg.thresholds;
+    const bg = cfg.report.excludeBackground ? backgroundMask(samples, live) : samples.map(() => false);
+    let bgSec = 0;
+    samples.forEach((s, i) => {
+      if (bg[i]) bgSec += i === 0 ? step / 1000 : (s.t - samples[i - 1].t) / 1000;
+    });
 
     // 連続値
     const cont = {};
@@ -123,6 +176,7 @@
           const s = samples[i];
           const v = s[m.field];
           if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+          if (bg[i]) continue;
           // 非表示のタブはブラウザが描画を間引くので、ドロップ率は当てにならない
           if (m.key === 'droppedPct' && s.visible === false) continue;
           if (m.key === 'headroom' && s.segKind === 'init') continue;
@@ -137,7 +191,7 @@
     const events = [];
     const counts = {};
     for (const m of COUNT) {
-      let total = 0, sec = 0, prev = null, prevSec = null;
+      let total = 0, sec = 0, prev = null, prevSec = null, bgTotal = 0, bgSecSum = 0;
       samples.forEach((s, i) => {
         const v = s[m.field];
         const vs = m.secField ? s[m.secField] : null;
@@ -145,17 +199,22 @@
           // 値が減ったらプレーヤーが作り直されたとみなし、その値を増分として足す
           const d = prev == null ? 0 : v >= prev ? v - prev : v;
           if (d > 0) {
-            total += d;
-            events.push({ t: s.t, i, kind: m.key, n: d });
+            if (bg[i]) bgTotal += d;
+            else total += d;
+            events.push({ t: s.t, i, kind: m.key, n: d, bg: bg[i] });
           }
           prev = v;
         }
         if (typeof vs === 'number') {
-          if (prevSec != null) sec += vs >= prevSec ? vs - prevSec : vs;
+          if (prevSec != null) {
+            const ds = vs >= prevSec ? vs - prevSec : vs;
+            if (bg[i]) bgSecSum += ds;
+            else sec += ds;
+          }
           prevSec = vs;
         }
       });
-      counts[m.key] = { total, sec, level: levelOf(th[m.key], total) };
+      counts[m.key] = { total, sec, bgTotal, bgSec: bgSecSum, level: levelOf(th[m.key], total) };
     }
     // stall・フリーズの継続時間: 発生から state が戻るまでの累積秒の増分
     for (const e of events) {
@@ -187,7 +246,7 @@
         const a = prevV.variantBps, b = s.variantBps;
         const isUp = a != null && b != null ? b > a : s.variantIndex > prevV.variantIndex;
         isUp ? up++ : down++;
-        events.push({ t: s.t, i, kind: isUp ? 'up' : 'down', from: prevV, to: s });
+        events.push({ t: s.t, i, kind: isUp ? 'up' : 'down', from: prevV, to: s, bg: bg[i] });
       }
       prevV = s;
     });
@@ -223,6 +282,8 @@
       totalSec,
       playSec,
       hiddenSec,
+      bgSec,
+      bgSpans: spansOf(samples, bg),
       pausedSec,
       live,
       cont,
@@ -286,6 +347,74 @@
    * stall の直前30秒を見て、原因の手がかりを1つ返す。
    * 断定はしない。レポートの文面でも「推定」と書く。
    */
+  /**
+   * 裏タブの影響を受けた区間（判定から外すサンプル）を true にした配列を返す。
+   * 古い履歴で visible が無いサンプルは「表示中」とみなす。
+   */
+  function backgroundMask(samples, live) {
+    const n = samples.length;
+    const mask = new Array(n).fill(false);
+    let i = 0;
+    while (i < n) {
+      if (samples[i].visible !== false) {
+        i++;
+        continue;
+      }
+      const start = i;
+      let paused = false;
+      while (i < n && samples[i].visible === false) {
+        mask[i] = true;
+        if (samples[i].state === 'paused') paused = true;
+        i++;
+      }
+      if (i >= n) break;
+
+      // 戻った後の回復期間
+      const back = samples[i].t;
+      let j = i;
+      if (live && paused) {
+        // 裏に回る前30秒の遅延を基準に、そこまで戻ったら回復とみなす
+        const t0 = samples[start].t;
+        const pre = median(
+          samples.filter((s) => s.t >= t0 - 30000 && s.t < t0 && s.visible !== false && typeof s.latencySec === 'number').map((s) => s.latencySec)
+        );
+        const td = median(samples.map((s) => s.targetDur).filter((v) => typeof v === 'number')) || 4;
+        const limit = (pre ?? 10) + Math.max(td * 2, 10);
+        while (
+          j < n &&
+          samples[j].t < back + 180000 &&
+          !(samples[j].state === 'playing' && typeof samples[j].latencySec === 'number' && samples[j].latencySec <= limit)
+        ) {
+          j++;
+        }
+      } else {
+        // 戻った直後はデコーダの立ち上げでフレームが落ちる。数秒だけ外す
+        const grace = paused ? 10000 : 5000;
+        while (j < n && samples[j].t < back + grace) j++;
+      }
+      // 回復期間の終わりに停止が掛かっていれば、抜けるまで含める
+      while (j < n && samples[j].state === 'stalled') j++;
+      for (let k = i; k < j; k++) mask[k] = true;
+      i = Math.max(j, i + 1);
+    }
+    return mask;
+  }
+
+  /** マスクが立っている連続区間を [開始時刻, 終了時刻] の配列にする */
+  function spansOf(samples, mask) {
+    const out = [];
+    let a = -1;
+    for (let i = 0; i <= samples.length; i++) {
+      if (i < samples.length && mask[i]) {
+        if (a < 0) a = i;
+      } else if (a >= 0) {
+        out.push([samples[a].t, samples[Math.min(i, samples.length - 1)].t]);
+        a = -1;
+      }
+    }
+    return out;
+  }
+
   function stallCause(samples, i) {
     const t0 = samples[i].t - 30000;
     let lowHead = false, slowDl = false, err = false;
@@ -393,7 +522,15 @@
     }
     const notes = [];
     if (p.down > 0) notes.push(`画質の引き下げが ${p.down} 回ありました（引き上げ ${p.up} 回）。`);
-    if (p.hiddenSec > p.totalSec * 0.1) notes.push(`タブが非表示だった時間が ${pct(p.hiddenSec / p.totalSec)} あり、その間のドロップ率は集計から除いています。`);
+    if (p.bgSec > 0) {
+      const ex = COUNT.filter((m) => p.counts[m.key].bgTotal > 0).map((m) => `${m.label} ${p.counts[m.key].bgTotal} ${m.unit}`);
+      notes.push(
+        `タブが裏に回っていた時間とその後の回復期間（計 ${dur(p.bgSec)}）は、ブラウザの省電力動作（ミュート動画の自動一時停止など）の影響を受けるため判定から除きました` +
+          (ex.length ? `（除外したもの: ${ex.join('、')}。イベント一覧に「裏タブ由来」として記載）。` : '。')
+      );
+    } else if (p.hiddenSec > p.totalSec * 0.1) {
+      notes.push(`タブが非表示だった時間が ${pct(p.hiddenSec / p.totalSec)} あり、その間のドロップ率は集計から除いています。`);
+    }
 
     return `
       <section class="summary">
@@ -575,6 +712,7 @@
         <p class="legend">
           <span class="lg crit"></span>重大値 <span class="lg warn"></span>警告値
           <span class="lg band"></span>再生停止 <span class="lg err"></span>HTTPエラー
+          ${cfg.report.excludeBackground ? '<span class="lg bg"></span>裏タブ（判定対象外）' : ''}
         </p>
         ${list.map((ch) => chart(p, ch)).join('')}
       </section>`;
@@ -615,6 +753,10 @@
     for (let k = 0; k <= 4; k++) {
       const t = t0 + ((t1 - t0) * k) / 4;
       svg += `<text class="ax" x="${x(t)}" y="${H - 5}" text-anchor="${k === 0 ? 'start' : k === 4 ? 'end' : 'middle'}">${esc(stamp(t).slice(11, 19))}</text>`;
+    }
+    // 判定から外した裏タブの区間
+    for (const [a, b] of p.bgSpans || []) {
+      svg += `<rect class="bgband" x="${x(a)}" y="${T}" width="${Math.max(x(b) - x(a), 1.5)}" height="${H - T - B}"/>`;
     }
     // 停止区間とエラー
     for (const e of p.events) {
@@ -696,6 +838,7 @@
     const detail = (e) => {
       if (e.kind === 'up' || e.kind === 'down') return `${bps(e.from.variantBps)}${e.from.variantRes ? ` ${e.from.variantRes}` : ''} → ${bps(e.to.variantBps)}${e.to.variantRes ? ` ${e.to.variantRes}` : ''}`;
       if (e.kind === 'errors') return `${e.n} 件`;
+      if (e.bg) return `${e.sec != null ? `${fix(e.sec, 1)} 秒　` : ''}裏タブ由来（判定対象外）`;
       return `${e.sec != null ? `${fix(e.sec, 1)} 秒` : ''}${e.cause ? `　推定原因: ${e.cause}` : ''}`;
     };
     return `
@@ -706,7 +849,7 @@
           <tbody>
           ${list
             .slice(0, EVENT_LIMIT)
-            .map((e) => `<tr><td>${esc(stamp(e.t).slice(11, 19))}</td><td><span class="tag ${cls[e.kind]}">${label[e.kind]}</span></td><td>${esc(detail(e))}</td></tr>`)
+            .map((e) => `<tr><td>${esc(stamp(e.t).slice(11, 19))}</td><td><span class="tag ${e.bg ? '' : cls[e.kind]}">${label[e.kind]}</span></td><td>${esc(detail(e))}</td></tr>`)
             .join('')}
           </tbody>
         </table>
@@ -755,6 +898,7 @@
           <div><dt>サンプル</dt><dd>${p.n} 件 / 間隔 ${fix(p.step / 1000, 1)} 秒${p.holes ? `（記録の欠け ${p.holes} 箇所）` : ''}</dd></div>
           <div><dt>一時停止・終了</dt><dd>${dur(p.pausedSec)}</dd></div>
           <div><dt>タブ非表示</dt><dd>${dur(p.hiddenSec)}（ドロップ率の集計から除外）</dd></div>
+          ${p.bgSec > 0 ? `<div><dt>判定から除いた時間</dt><dd>${dur(p.bgSec)}（裏タブとその後の回復期間）</dd></div>` : ''}
           <div><dt>キャッシュ判定</dt><dd>${p.cacheHitRatio == null ? '判定できない配信' : `判定可 ${pct(p.cacheKnownRatio)} / うちキャッシュ ${pct(p.cacheHitRatio)}`}</dd></div>
         </dl>
       </section>`;
@@ -775,7 +919,8 @@
       <section class="criteria">
         <h2>判定基準</h2>
         <p class="dim">しきい値は HLS Analyzer の設定画面の値です。連続値は再生開始後のサンプルだけを使い、一時的な落ち込みで判定が振れないよう
-          分布の端（5%点）をしきい値と比べます。重大が1つでもあれば「不良」、警告が1つでもあれば「注意」、それ以外を「良好」とします。</p>
+          分布の端（5%点）をしきい値と比べます。重大が1つでもあれば「不良」、警告が1つでもあれば「注意」、それ以外を「良好」とします。
+          ${cfg.report.excludeBackground ? 'タブが裏に回っていた時間と、その後の回復期間（非表示中に一時停止したライブは遅延が元の水準に戻るまで、それ以外は数秒）は、ブラウザの省電力動作の影響を受けるため判定に使いません。' : ''}</p>
         <table class="grid">
           <thead><tr><th>指標</th><th>比べる値</th><th>警告</th><th>重大</th></tr></thead>
           <tbody>
